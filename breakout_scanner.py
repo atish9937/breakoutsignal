@@ -1,13 +1,29 @@
 #!/usr/bin/env python3
 """
 breakout_scanner.py - Intraday "box breakout" scanner for NSE F&O stocks (Dhan API v2)
-====================================================================================
+========================================================================================
 
-Finds stocks that break out of their 5-day box with volume, still have room to run,
-and have a clear runway to the next option-OI wall. Same rules as the
-"Intraday Breakout Checklist" (JSW Steel, 15 Oct 2026).
+Finds stocks that break out of their 5-day box with volume, still have room to run, and have
+a clear runway to the next option-OI wall. Same rules as the "Intraday Breakout Checklist"
+(JSW Steel, 15 Oct 2026).
 
-It ONLY READS data and prints/saves signals. It never places orders.
+It ONLY READS data and prints/saves recommendations. It never places orders.
+
+WHAT THE SCRIPT DECIDES, WHAT AI VALIDATES
+    The script still makes the actual BUY_CE/BUY_PE recommendation itself, exactly as it always
+    did: everything mechanical and gettable from the Dhan API (candles, ATR, box levels,
+    VWAP/RSI/MACD, the fresh-breakout definition, option-chain walls/premiums/lot sizes, stop/
+    target math) plus a quality score built from trend/momentum/VWAP/Nifty alignment. Clear the
+    mechanical gates AND the quality-score bar (min_recommend_score) and the script calls it
+    BUY_CE/BUY_PE - a real recommendation, not a neutral "here's some data" dump.
+
+    What the script can never do is check things outside its own numbers: today's news/catalyst
+    (it has no news access), whether several of today's recommendations are really the same bet
+    in disguise (3 bank stocks all riding one Nifty move), and the broader market regime. So
+    every BUY recommendation carries an "ai_validation" block - a checklist for you or an AI
+    (e.g. Claude) to VALIDATE that recommendation against exactly those things, and sign off as
+    VALIDATED / VETOED / SIZE-DOWN. AI reviews the call the script already made; it does not
+    invent the call from a blank slate.
 
 SETUP (one time)
     pip install requests pandas
@@ -34,17 +50,22 @@ UNIVERSE (pulled fresh every day, cached in scanner_out/)
     has ever been downloaded. The start-up lines always say which source was used.
 
 OUTPUT (folder ./scanner_out/)
-    prep_YYYY-MM-DD.json   daily levels (box, ATR, prev day) - built once per day
-    scan_YYYY-MM-DD.jsonl  every evaluation, one JSON per line
-    latest.json            the most recent scan (market + all candidates)
-    signals_YYYY-MM-DD.jsonl  only BUY_CE / BUY_PE signals
-    On screen: a table each scan, and a "SIGNAL FOR CLAUDE" JSON block on every BUY.
-    Copy that block into Claude for a second opinion.
+    prep_YYYY-MM-DD.json      daily levels (box, ATR, prev day) - built once per day
+    scan_YYYY-MM-DD.jsonl     every evaluation, one JSON per line
+    latest.json               the most recent scan (market + all candidates)
+    signals_YYYY-MM-DD.jsonl  only BUY_CE / BUY_PE recommendations
+    On screen: a table each scan, a "RECOMMENDATION FOR AI VALIDATION" JSON block for every new
+    BUY, plus one "AI VALIDATION BATCH" block per scan with all of that scan's recommendations
+    together (so the correlation/overlap check has something to compare). Paste either block
+    into Claude (or your own AI layer) to validate it before you act - catalyst/news especially,
+    since the script cannot check that itself.
 
 THE CONCLUSIVE FIELD: "verdict"
-    BUY_CE / BUY_PE   all checks passed - a trade you can consider now
+    BUY_CE / BUY_PE    the script's own recommendation - mechanical gates + quality score both
+                       passed. Still needs AI/human VALIDATION (see "ai_validation") before you
+                       act on it - catalyst/news and cross-recommendation overlap aren't checked.
     WATCH_CE / WATCH_PE  near its trigger but not triggered yet - watch the level
-    SKIP_CE / SKIP_PE    failed one or more checks ("fails" lists why)
+    SKIP_CE / SKIP_PE    failed a mechanical gate or the quality-score bar ("fails" lists why)
     plus "risk_warning" when one lot's loss at the stop is above your max risk %.
 
 Research tool, not SEBI-registered investment advice. Verify every level on your broker.
@@ -69,27 +90,40 @@ import requests
 # --------------------------------------------------------------------------------------
 CONFIG = {
     "capital": 72000,            # your trading capital in Rs
-    "max_risk_pct": 2.0,         # max loss per trade as % of capital
-    "block_over_risk": False,    # True = downgrade BUY to SKIP if one lot risks more than max_risk_pct
+    "max_risk_pct": 2.0,         # max loss per trade as % of capital - reported via risk_warning
+    "block_over_risk": False,    # True = a mechanical safety cap: downgrade BUY to SKIP if
+                                  # one lot risks more than max_risk_pct. False (default) leaves
+                                  # sizing to you/AI - the recommendation still shows with risk_warning set.
     "atr_period": 14,            # daily ATR length
     "box_days": 5,               # box = high/low of the last N completed days
-    "max_atr_used": 0.60,        # skip if |price - open| > 60% of ATR (move already done)
+    "max_atr_used": 0.60,        # mechanical: skip if |price - open| > 60% of ATR (move already done)
     "watch_dist_pct": 0.60,      # list as WATCH when within 0.6% of the box edge
-    "max_chase_pct": 0.50,       # don't buy if already >0.5% beyond the box edge
-    "max_vwap_dist_pct": 1.0,    # price must be within 1% of VWAP
+    "max_chase_pct": 0.50,       # mechanical: don't recommend it if already >0.5% beyond the edge
+    "max_vwap_dist_pct": 1.0,    # price must be within 1% of VWAP to count as "vwap_aligned"
     "stop_atr_mult": 0.35,       # stop distance = 0.35 x ATR (JSW: 0.35 x 30 = ~Rs 11)
-    "min_runway_r": 2.0,         # next OI wall must be >= 2R away
+    "min_runway_r": 2.0,         # mechanical: next OI wall must be >= 2R away, or there's no room to trade
     "t1_r": 1.5,                 # target 1 = 1.5R
     "t2_r": 2.5,                 # target 2 = 2.5R (capped just before the wall)
     "wall_frac": 0.5,            # a strike counts as a "wall" if its OI >= 50% of the biggest
-    "min_auto_score": 6,         # of 7 automatic factors (catalyst/news is left to you/Claude)
-    "max_option_spread_pct": 3.0,  # bid-ask spread of the option, % of its price
+    "min_recommend_score": 4,    # of 5 quality factors (catalyst/news is not counted - AI
+                                  # validates that separately; see ai_validation on every BUY)
+    "max_option_spread_pct": 3.0,  # mechanical: option must be liquid enough to actually fill
     "entry_start": "09:30",
     "entry_cutoff": "12:30",
     "run_start": "09:20",
     "run_end": "12:35",
     "max_candidates_per_scan": 8,  # option-chain calls are slow (1 per 3 s)
 }
+
+# The 5 quality factors (daily_trend, intraday_trend, momentum, vwap_aligned, nifty_aligned)
+# drive the script's own BUY recommendation via min_recommend_score above - same role scoring
+# always had. "catalyst" is the one factor the script can never fill in (no news access), so
+# it's never counted in the script's score; AI/you must research it as part of validating any
+# BUY the script recommends (see the "ai_validation" block on every BUY_CE/BUY_PE result).
+QUALITY_FACTORS_NOTE = (
+    "daily_trend, intraday_trend, momentum, vwap_aligned and nifty_aligned feed the script's own "
+    "min_recommend_score bar. catalyst is always null - AI/you must check news before acting."
+)
 
 # Built-in list. NOT used by default any more (the default is the live Nifty 50 list from NSE).
 # It is used only if you pass --universe watchlist, or as a last resort if NSE has never been
@@ -582,6 +616,8 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True):
                 "vwap": r2(vw), "ema9": r2(e9), "ema21": r2(e21), "rsi14_5m": r2(rs), "macd_hist_5m": r2(mh)})
 
     # 3. trigger: 5-min CLOSE beyond the box edge, fresh (this or previous candle crossed)
+    # Everything in this block is MECHANICAL (a formula on Dhan data) and gates the verdict -
+    # it defines what "a fresh box breakout" even means, it isn't a judgment call.
     beyond = sign * (last["close"] - level) > 0
     crossed_recent = any(sign * (x - level) <= 0 for x in c["close"].iloc[-3:-1])
     triggered = beyond and crossed_recent
@@ -607,11 +643,13 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True):
     t = now.strftime("%H:%M")
     time_ok = CONFIG["entry_start"] <= t <= CONFIG["entry_cutoff"]
     (passes if time_ok else fails).append(f"time {t}")
+
+    # INFORMATIONAL from here - reported for AI/you to weigh, never gates the verdict.
     vdist = sign * (ltp - vw) / vw * 100
     vwap_ok = 0 <= vdist <= CONFIG["max_vwap_dist_pct"]
-    (passes if vwap_ok else fails).append(f"{vdist:+.2f}% from VWAP")
     nifty_ok = (side == "CE" and nifty["bias"] != "DOWN") or (side == "PE" and nifty["bias"] != "UP")
-    (passes if nifty_ok else fails).append(f"Nifty {nifty['bias']}")
+    res["vwap_note"] = f"{vdist:+.2f}% from VWAP ({'within' if vwap_ok else 'outside'} {CONFIG['max_vwap_dist_pct']}% band)"
+    res["nifty_note"] = f"Nifty bias {nifty['bias']}, trade is {'aligned' if nifty_ok else 'against it'}"
 
     # 4. trade plan on the underlying
     entry = max(ltp, level) if side == "CE" else min(ltp, level)
@@ -629,6 +667,9 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True):
         except Exception as e:  # noqa: BLE001
             fails.append(f"option chain error {e}")
     runway_ok = liquid_ok = False
+    if opt_info is None and not any("option chain error" in f for f in fails):
+        fails.append("no option chain data (no expiry or chain unavailable) - "
+                     "runway and liquidity can't be checked")
     if opt_info:
         wall = opt_info["wall"]
         runway_r = (sign * (wall - entry) / risk) if wall else 99.0
@@ -663,40 +704,83 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True):
         }
     res["plan"] = plan
 
-    # 6. score (7 automatic factors; catalyst/news = null, judge it yourself / ask Claude)
+    # 6. quality/conviction factors. These feed the script's own BUY recommendation below (same
+    # role they always had) - they are also handed to AI as "factors"/"quality_score" so AI can
+    # re-weigh them qualitatively during validation, rather than treating the count as gospel.
+    # "catalyst" is always null: the script has no news access, so it is never part of the
+    # script's own score - AI must research it as part of validating the recommendation.
     trend = (ltp > p["sma20"]) if side == "CE" else (ltp < p["sma20"])
     intra = ((ltp > vw and e9 > e21) if side == "CE" else (ltp < vw and e9 < e21))
     mom = ((55 <= rs <= 75 or mh > 0) if side == "CE" else (25 <= rs <= 45 or mh < 0))
-    volf = bool(vol_ok and (rvol is None or rvol >= 0.8))
     factors = {"daily_trend": bool(trend), "intraday_trend": bool(intra), "momentum": bool(mom),
-               "volume": volf, "breakout_close": bool(triggered), "oi_runway": bool(runway_ok),
-               "catalyst": None, "nifty_aligned": bool(nifty_ok)}
-    auto = sum(1 for v in factors.values() if v)
+               "vwap_aligned": bool(vwap_ok), "nifty_aligned": bool(nifty_ok), "catalyst": None}
+    quality_true = sum(1 for v in factors.values() if v is True)
+    quality_total = sum(1 for v in factors.values() if v is not None)
     res["factors"] = factors
-    res["score"] = f"{auto}/7 auto (+ catalyst unknown)"
+    res["quality_score"] = f"{quality_true}/{quality_total} (catalyst not counted - unknown to the script)"
 
-    # 7. verdict
-    hard = [used <= CONFIG["max_atr_used"], triggered, chase_pct <= CONFIG["max_chase_pct"], vol_ok, time_ok,
-            vwap_ok, runway_ok, liquid_ok, nifty_ok]
-    if all(hard) and auto >= CONFIG["min_auto_score"]:
+    # 7. verdict. MECHANICAL gates (fresh trigger, not chased, breakout volume, ATR budget, entry
+    # window, OI-wall runway, liquid option) must ALL pass - that's the checklist's own definition
+    # of a valid box breakout, not a judgment call. On top of that, the script makes its own
+    # BUY_CE/BUY_PE recommendation exactly as it always did: mechanical gates passed AND the
+    # quality score clears min_recommend_score. AI's role (see "ai_validation" below) is to
+    # VALIDATE that already-made recommendation against catalyst/news, cross-candidate
+    # correlation and regime - things the script can't check - not to originate the call itself.
+    mechanical_gates = {
+        "room left (ATR used)": used <= CONFIG["max_atr_used"],
+        "fresh trigger": triggered,
+        "not already chased": chase_pct <= CONFIG["max_chase_pct"],
+        "breakout volume": vol_ok,
+        "within entry window": time_ok,
+        "runway to next OI wall": runway_ok,
+        "option tradeable/liquid": liquid_ok,
+    }
+    mechanical_ok = all(mechanical_gates.values())
+    if mechanical_ok and quality_true >= CONFIG["min_recommend_score"]:
         verdict = f"BUY_{side}"
     elif (not triggered and 0 < dist_pct <= CONFIG["watch_dist_pct"] and used <= CONFIG["max_atr_used"]
-          and time_ok and nifty_ok):
+          and time_ok):
         verdict = f"WATCH_{side}"
     else:
         verdict = f"SKIP_{side}"
+        res["failed_gates"] = [name for name, ok in mechanical_gates.items() if not ok]
+        if mechanical_ok:
+            fails.append(f"quality score {quality_true}/{quality_total} below "
+                         f"min_recommend_score {CONFIG['min_recommend_score']}")
     over = res.get("option", {}).get("loss_pct_of_capital")
     if over and over > CONFIG["max_risk_pct"]:
         res["risk_warning"] = f"one lot risks {over}% of capital (max {CONFIG['max_risk_pct']}%)"
         if CONFIG["block_over_risk"] and verdict.startswith("BUY"):
             verdict = f"SKIP_{side}"
-            fails.append("over max risk per trade")
+            fails.append("over max risk per trade (block_over_risk is on)")
     if verdict.startswith("WATCH"):
         res["watch_note"] = (f"Trigger: 5-min close {'above' if side=='CE' else 'below'} {level:.2f} "
                              f"with volume > avg of prior 3 candles, before {CONFIG['entry_cutoff']}")
     if verdict.startswith("BUY"):
         res["valid_range"] = [r2(level), r2(level * (1 + sign * CONFIG["max_chase_pct"] / 100))]
         res["rules"] = "Exit by 15:15. Move stop to entry after T1. Skip if price is already beyond valid_range."
+        res["ai_validation"] = {
+            "status": "RECOMMENDED_BY_SCRIPT_NEEDS_AI_VALIDATION",
+            "why": (f"The script's own checklist recommends {verdict}: all mechanical gates "
+                    f"passed and quality score {quality_true}/{quality_total} cleared "
+                    f"min_recommend_score {CONFIG['min_recommend_score']}. AI validates this "
+                    "recommendation against what the script can't check - it does not re-decide "
+                    "from a blank slate."),
+            "checklist_for_ai": [
+                "Catalyst/news: search for results, filings, rating changes or sector news on "
+                f"{sym} today. Contradicting news (e.g. bad news on a BUY_CE) should veto the "
+                "recommendation; supportive or neutral news lets it stand.",
+                "Sanity-check the quality factors qualitatively (see 'factors'/'quality_score') "
+                "- the script's count is a heuristic, not proof; flag it if something looks off.",
+                "Check this recommendation against the other entries in the same scan "
+                "('scan_recommendations' in the batch block) for sector/index overlap - several "
+                "correlated recommendations are not independent bets and may call for smaller size.",
+                "Consider the broader regime (Nifty bias/chg_pct, how many BUYs vs SKIPs this "
+                "scan found) - breakout systems do worse in a choppy/range-bound tape.",
+                "If risk_warning is set, decide whether to size down rather than skip outright.",
+                "Give a final sign-off: VALIDATED / VETOED / SIZE-DOWN, with reasoning.",
+            ],
+        }
     res["verdict"], res["fails"], res["passes"] = verdict, fails, passes
     return res
 
@@ -725,8 +809,8 @@ def scan(dh, master, prep, day, exclude, fired, universe=None):
             ahead = nearest_level(p, side, ltp)
             behind = nearest_level(p, side, ltp * (1 - sign * CONFIG["max_chase_pct"] / 100))
             level = ahead if abs(ahead - ltp) <= abs(behind - ltp) else behind
-            if side == "CE" and nifty["bias"] == "DOWN" or side == "PE" and nifty["bias"] == "UP":
-                continue
+            # Nifty alignment only feeds the quality score in evaluate(), it isn't a hard gate -
+            # don't pre-filter on it here either, or a counter-trend setup never even gets scored.
             to_go = sign * (level - ltp) / ltp * 100  # % still to go (negative = beyond)
             if -CONFIG["max_chase_pct"] <= to_go <= CONFIG["watch_dist_pct"] and used <= CONFIG["max_atr_used"] + 0.1:
                 pre.append((abs(to_go), s, side, q))
@@ -755,17 +839,33 @@ def scan(dh, master, prep, day, exclude, fired, universe=None):
             f.write(json.dumps({"nifty_bias": nifty["bias"], **r}) + "\n")
 
     print_scan(snapshot)
+    new_signals = []
     for r in results:
         key = f"{r['symbol']}_{r['side']}"
         if r["verdict"].startswith("BUY") and key not in fired:
             fired.add(key)
+            new_signals.append(r)
             signal = {"type": "SIGNAL", "scan_time": snapshot["scan_time"], "nifty": nifty, **r}
             with open(OUT / f"signals_{day}.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps(signal) + "\n")
-            print("\n=========== SIGNAL FOR CLAUDE (copy from here) ===========")
+            print("\n=========== RECOMMENDATION FOR AI VALIDATION (copy from here) ===========")
             print(json.dumps(signal, indent=2))
-            print("=========== END SIGNAL ===========\n")
+            print("=========== END RECOMMENDATION - script says BUY, AI must validate it ===========\n")
             notify(r)
+    if new_signals:
+        # One batch per scan, every new recommendation together, so the cross-recommendation
+        # correlation and regime checks in "ai_validation" actually have something to compare.
+        batch = {
+            "type": "AI_VALIDATION_BATCH", "scan_time": snapshot["scan_time"], "nifty": nifty,
+            "expiry": snapshot["expiry"],
+            "scan_recommendations": [{"symbol": r["symbol"], "side": r["side"], "ltp": r.get("ltp"),
+                                       "quality_score": r.get("quality_score")}
+                                      for r in new_signals],
+            "recommendations": new_signals,
+        }
+        print("\n=========== AI VALIDATION BATCH (all new recommendations this scan, copy from here) ===========")
+        print(json.dumps(batch, indent=2))
+        print("=========== END AI VALIDATION BATCH ===========\n")
     return snapshot
 
 
@@ -776,23 +876,26 @@ def print_scan(snap):
     if not snap["results"]:
         print("  no stock near a box edge with room left")
         return
-    print(f"  {'VERDICT':10} {'SYMBOL':11} {'LTP':>9} {'LEVEL':>9} {'TOGO%':>6} {'ATR%':>5} {'VOLx':>5} {'SCORE':>5}  WHY NOT")
+    print(f"  {'VERDICT':8} {'SYMBOL':11} {'LTP':>9} {'LEVEL':>9} {'TOGO%':>6} {'ATR%':>5} {'VOLx':>5} {'QUAL':>5}  WHY NOT")
     for r in snap["results"]:
         fails = "; ".join(r.get("fails", [])[:3])
-        print(f"  {r['verdict']:10} {r['symbol']:11} {r.get('ltp') or '':>9} {r.get('trigger_level') or '':>9} "
+        print(f"  {r['verdict']:8} {r['symbol']:11} {r.get('ltp') or '':>9} {r.get('trigger_level') or '':>9} "
               f"{r.get('dist_to_trigger_pct') if r.get('dist_to_trigger_pct') is not None else '':>6} "
               f"{r.get('atr_used_pct') or '':>5} {r.get('vol_vs_prev3') or '':>5} "
-              f"{(r.get('score') or '')[:3]:>5}  {fails}")
+              f"{(r.get('quality_score') or '')[:5]:>5}  {fails}")
 
 
 def notify(r):
-    """Beep + optional Telegram (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)."""
+    """Beep + optional Telegram (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID).
+    This is the script's own BUY recommendation - still needs AI/human validation (ai_validation)
+    against catalyst/news and cross-recommendation overlap before you act on it."""
     print("\a", end="")
     tok, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     if not (tok and chat):
         return
     o, p = r.get("option", {}), r.get("plan", {})
-    text = (f"{r['verdict']} {r['symbol']} @ {r['ltp']} (trigger {r['trigger_level']})\n"
+    text = (f"{r['verdict']} {r['symbol']} @ {r['ltp']} (trigger {r['trigger_level']}) - "
+            f"validate catalyst/news before acting\n"
             f"{o.get('contract')} ~Rs{o.get('premium')} lot {o.get('lot_size')}\n"
             f"Stop {p.get('stop')} / prem {o.get('premium_stop')} | T1 {p.get('t1')} / {o.get('premium_t1')} | "
             f"T2 {p.get('t2')} / {o.get('premium_t2')}\nLoss/lot {o.get('loss_per_lot_at_stop')} "
@@ -842,7 +945,7 @@ def main():
         prep = prepare(dh, day, universe)
         fired: set[str] = set()
         sig_file = OUT / f"signals_{day}.jsonl"
-        if sig_file.exists():  # don't repeat signals after a restart
+        if sig_file.exists():  # don't repeat recommendations after a restart
             for line in sig_file.read_text().splitlines():
                 j = json.loads(line)
                 fired.add(f"{j['symbol']}_{j['side']}")
