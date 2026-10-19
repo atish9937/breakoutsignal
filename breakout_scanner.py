@@ -7,7 +7,8 @@ Finds stocks that break out of their 5-day box with volume, still have room to r
 a clear runway to the next option-OI wall. Same rules as the "Intraday Breakout Checklist"
 (JSW Steel, 15 Oct 2026).
 
-It ONLY READS data and prints/saves recommendations. It never places orders.
+By default it only reads data and prints/saves recommendations; optional live order
+submission is disabled unless explicitly enabled (see "LIVE ORDER EXECUTION" below).
 
 WHAT THE SCRIPT DECIDES, WHAT AI VALIDATES
     The script still makes the actual BUY_CE/BUY_PE recommendation itself, exactly as it always
@@ -30,12 +31,39 @@ SETUP (one time)
     Set your Dhan credentials (Dhan web -> My Profile -> DhanHQ Trading APIs):
       Windows (PowerShell):  $env:DHAN_CLIENT_ID="1100xxxxxx"; $env:DHAN_ACCESS_TOKEN="eyJ..."
       Mac/Linux:             export DHAN_CLIENT_ID=1100xxxxxx; export DHAN_ACCESS_TOKEN=eyJ...
-    (or put them in config.json next to this file: {"client_id": "...", "access_token": "..."})
+    (or copy .env.example to .env next to this file and set DHAN_CLIENT_ID and
+    DHAN_ACCESS_TOKEN there; keep .env private with chmod 600)
+    To receive Telegram alerts for new BUY recommendations, create a bot with @BotFather,
+    get your chat ID, then set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the environment
+    or add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to .env; see .env.example.
+    For a channel, add the bot as an administrator with permission to post;
+    use @public_channel_name for a public channel or the -100... chat ID for a private channel.
+    Telegram is optional; the scanner still beeps when it is not configured.
     The access token expires every 24 h - paste a fresh one each morning.
+    LIVE ORDER EXECUTION (optional, off unless explicitly enabled)
+    Dhan order placement requires a static IP whitelisted in Dhan. Set
+    ENABLE_LIVE_ORDERS=true in .env AND pass --enable-live-orders to submit
+    one INTRADAY LIMIT buy at the selected option's current ask for each new BUY signal.
+    The selected contract must have an exact scrip-master security ID and lot size.
+    Limit orders may remain unfilled. This only submits entries; it does not manage exits.
+    Live orders do not wait for the AI-validation checklist. Each symbol/side is attempted at
+    most once per day; rejected or uncertain submissions are not automatically retried.
+
+UNIX / CRON
+    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+    cp .env.example .env && chmod 600 .env
+    Edit .env with Dhan credentials. For live orders, ENABLE_LIVE_ORDERS=true must be
+    set and the cron command must include --enable-live-orders.
+    Run run_unix.sh --once to test scanning without submitting orders.
+    chmod +x run_unix.sh
+    Schedule run_unix.sh --once every 5 minutes during NSE entry hours, with scanner_out/cron.log
+    as the log. The script uses flock to skip overlapping cron runs. Configure the server/cron
+    timezone as Asia/Kolkata. Dhan order APIs require a static IP whitelisted in Dhan.
 
 RUN
     python breakout_scanner.py                  # runs 09:20-12:35 IST, scans every 5 min
     python breakout_scanner.py --once           # one scan now (for testing)
+    python breakout_scanner.py --ignore-entry-cutoff  # extend entry cutoff to 15:25 IST; scan through market close
     python breakout_scanner.py --exclude TECHM,WIPRO   # skip stocks (results today / F&O ban)
     python breakout_scanner.py --universe nifty100      # which stocks to scan (default nifty50)
 
@@ -54,6 +82,7 @@ OUTPUT (folder ./scanner_out/)
     scan_YYYY-MM-DD.jsonl     every evaluation, one JSON per line
     latest.json               the most recent scan (market + all candidates)
     signals_YYYY-MM-DD.jsonl  only BUY_CE / BUY_PE recommendations
+    orders_YYYY-MM-DD.jsonl   live order attempts and outcomes (when live orders are enabled)
     On screen: a table each scan, a "RECOMMENDATION FOR AI VALIDATION" JSON block for every new
     BUY, plus one "AI VALIDATION BATCH" block per scan with all of that scan's recommendations
     together (so the correlation/overlap check has something to compare). Paste either block
@@ -75,6 +104,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -84,6 +114,7 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 
 # --------------------------------------------------------------------------------------
 # SETTINGS - change these to suit you
@@ -112,8 +143,12 @@ CONFIG = {
     "entry_cutoff": "12:30",
     "run_start": "09:20",
     "run_end": "12:35",
-    "max_candidates_per_scan": 8,  # option-chain calls are slow (1 per 3 s)
+    "extended_entry_cutoff": "15:25",
+    "extended_run_end": "15:30",
+    "max_candidates_per_scan": 15,  # option-chain calls are slow (1 per 3 s)
 }
+
+MIN_DISPLAY_QUALITY = 3
 
 # The 5 quality factors (daily_trend, intraday_trend, momentum, vwap_aligned, nifty_aligned)
 # drive the script's own BUY recommendation via min_recommend_score above - same role scoring
@@ -153,19 +188,21 @@ API = "https://api.dhan.co/v2"
 SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 OUT = Path(__file__).resolve().parent / "scanner_out"
+ENV_FILE = Path(__file__).resolve().parent / ".env"
 
 
 # --------------------------------------------------------------------------------------
-# Dhan REST client (read-only)
+# Dhan REST client
 # --------------------------------------------------------------------------------------
 class DhanAuthError(RuntimeError):
     pass
 
 
 class Dhan:
-    """Minimal read-only Dhan v2 client with simple rate limiting."""
+    """Minimal Dhan v2 client with simple rate limiting for read APIs."""
 
     def __init__(self, client_id: str, access_token: str):
+        self.client_id = str(client_id)
         self.s = requests.Session()
         self.s.headers.update({
             "access-token": access_token,
@@ -175,12 +212,19 @@ class Dhan:
         })
         self._last: dict[str, float] = {}
 
-    def _post(self, path: str, body: dict, min_gap: float = 0.25) -> dict:
+    def _post(self, path: str, body: dict, min_gap: float = 0.25,
+              timeout: float | tuple[float, float] = 30) -> dict:
         wait = min_gap - (time.time() - self._last.get(path, 0.0))
         if wait > 0:
             time.sleep(wait)
         for attempt in range(4):
-            r = self.s.post(API + path, json=body, timeout=30)
+            try:
+                r = self.s.post(API + path, json=body, timeout=timeout)
+            except (requests.Timeout, requests.ConnectionError):
+                if attempt == 3:
+                    raise
+                time.sleep(2 * (attempt + 1))
+                continue
             self._last[path] = time.time()
             if r.status_code == 429:
                 time.sleep(2 + 2 * attempt)
@@ -203,6 +247,12 @@ class Dhan:
                 "toDate": str(today + dt.timedelta(days=1))}
         return candles_df(self._post("/charts/historical", body))
 
+    def daily_range(self, sid, frm: dt.date, to: dt.date, seg="NSE_EQ", inst="EQUITY") -> pd.DataFrame:
+        body = {"securityId": str(sid), "exchangeSegment": seg, "instrument": inst,
+                "expiryCode": 0, "oi": False,
+                "fromDate": str(frm), "toDate": str(to)}
+        return candles_df(self._post("/charts/historical", body))
+
     def intraday(self, sid, frm: dt.datetime, to: dt.datetime, seg="NSE_EQ", inst="EQUITY",
                  interval=5) -> pd.DataFrame:
         body = {"securityId": str(sid), "exchangeSegment": seg, "instrument": inst,
@@ -223,6 +273,21 @@ class Dhan:
         j = self._post("/optionchain", {"UnderlyingScrip": int(sid), "UnderlyingSeg": seg,
                                         "Expiry": expiry}, min_gap=3.1)
         return j.get("data", {})
+
+    def rolling_option(self, body: dict) -> dict:
+        return self._post("/charts/rollingoption", body, timeout=(10, 90))
+
+    def place_order(self, body: dict) -> dict:
+        """Submit a single order without automatic retries to avoid duplicate live orders."""
+        response = self.s.post(API + "/orders", json=body, timeout=(10, 30))
+        response.raise_for_status()
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Dhan order API returned invalid JSON") from exc
+        if not isinstance(result, dict) or not result.get("orderId"):
+            raise RuntimeError("Dhan order API response did not include an orderId")
+        return result
 
 
 def candles_df(j: dict) -> pd.DataFrame:
@@ -572,7 +637,8 @@ def nearest_level(p: dict, side: str, price: float) -> float:
     return next((x for x in lv if x < price), lv[-1])
 
 
-def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True):
+def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
+             ignore_entry_cutoff=False):
     p = prep["stocks"][sym]
     ohlc = q.get("ohlc") or {}
     ltp, o = float(q.get("last_price") or 0), float(ohlc.get("open") or 0)
@@ -581,13 +647,21 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True):
     level = nearest_level(p, side, ltp)
     res = {"time": now.strftime("%H:%M:%S"), "symbol": sym, "side": side, "ltp": r2(ltp),
            "day_open": r2(o), "day_high": r2(ohlc.get("high")), "day_low": r2(ohlc.get("low")),
-           "trigger_level": r2(level), "atr": r2(a)}
+           "trigger_level": r2(level), "atr": r2(a), "mechanical_checks": []}
     fails, passes = [], []
+
+    def record_check(name, current, criterion, passed):
+        res["mechanical_checks"].append({
+            "gate": name, "current": current, "criterion": criterion, "passed": bool(passed),
+        })
+        return bool(passed)
 
     # 1. room left
     used = abs(ltp - o) / a if a and o else 9
     res["atr_used_pct"] = r2(used * 100)
-    (passes if used <= CONFIG["max_atr_used"] else fails).append(f"ATR used {used*100:.0f}%")
+    atr_ok = record_check("ATR room", f"{used * 100:.2f}%", f"<= {CONFIG['max_atr_used'] * 100:.0f}%",
+                          used <= CONFIG["max_atr_used"])
+    (passes if atr_ok else fails).append(f"ATR used {used*100:.0f}%")
 
     # 2. intraday candles (completed only)
     frm = dt.datetime.combine(day, dt.time(9, 15), IST)
@@ -596,6 +670,10 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True):
     last_open_allowed = pd.Timestamp(now).tz_convert(IST) - pd.Timedelta(minutes=5)
     c = c[c.index <= last_open_allowed]  # keep only candles that have fully closed
     if len(c) < 4:
+        res["mechanical_checks"].append({
+            "gate": "5-minute candle data", "current": f"{len(c)} completed candles",
+            "criterion": "at least 4", "passed": False,
+        })
         res.update({"verdict": f"SKIP_{side}", "fails": ["fewer than 4 completed 5-min candles"], "passes": passes})
         return res
     last, prev3 = c.iloc[-1], c.iloc[-4:-1]
@@ -631,18 +709,32 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True):
         fails.append("broke out more than 2 candles ago (not fresh)")
     else:
         fails.append(f"not triggered ({dist_pct:.2f}% to go)")
+    trigger_ok = record_check(
+        "Fresh breakout",
+        f"last close {last['close']:.2f}; trigger {level:.2f}; recent cross={crossed_recent}",
+        "completed 5-min close beyond trigger, crossed within last 2 candles",
+        triggered,
+    )
     # warn when the level was already crossed earlier today and price fell back (failed breakout)
     day_ext = c["high"].max() if side == "CE" else c["low"].min()
     if not beyond and sign * (day_ext - level) > 0:
         res["level_rejected_today"] = True
         fails.append(f"level already broken today (day {'high' if side == 'CE' else 'low'} "
                      f"{day_ext:.2f}) and price fell back - failed breakout")
-    (passes if chase_pct <= CONFIG["max_chase_pct"] else fails).append(f"chase {max(chase_pct,0):.2f}%")
-    vol_ok = vol_ratio is not None and vol_ratio > 1.0
+    chase_ok = record_check("Chase limit", f"{max(chase_pct, 0):.2f}%",
+                            f"<= {CONFIG['max_chase_pct']:.2f}%", chase_pct <= CONFIG["max_chase_pct"])
+    (passes if chase_ok else fails).append(f"chase {max(chase_pct,0):.2f}%")
+    volume_current = f"{vol_ratio:.2f}x" if vol_ratio is not None else "unavailable"
+    vol_ok = record_check("Breakout volume", volume_current, "> 1.00x previous 3-candle average",
+                          vol_ratio is not None and vol_ratio > 1.0)
     (passes if vol_ok else fails).append(f"breakout volume {vol_ratio or 0:.2f}x prev 3")
     t = now.strftime("%H:%M")
-    time_ok = CONFIG["entry_start"] <= t <= CONFIG["entry_cutoff"]
-    (passes if time_ok else fails).append(f"time {t}")
+    time_ok = is_entry_time(now, ignore_entry_cutoff)
+    cutoff = CONFIG["extended_entry_cutoff"] if ignore_entry_cutoff else CONFIG["entry_cutoff"]
+    time_ok = record_check("Entry time", t, f"{CONFIG['entry_start']}–{cutoff} IST", time_ok)
+    time_note = (f"time {t} (extended cutoff {CONFIG['extended_entry_cutoff']})"
+                 if ignore_entry_cutoff else f"time {t}")
+    (passes if time_ok else fails).append(time_note)
 
     # INFORMATIONAL from here - reported for AI/you to weigh, never gates the verdict.
     vdist = sign * (ltp - vw) / vw * 100
@@ -672,9 +764,13 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True):
                      "runway and liquidity can't be checked")
     if opt_info:
         wall = opt_info["wall"]
-        runway_r = (sign * (wall - entry) / risk) if wall else 99.0
-        runway_ok = runway_r >= CONFIG["min_runway_r"]
-        (passes if runway_ok else fails).append(f"runway {runway_r:.1f}R to wall {wall}")
+        runway_r = (sign * (wall - entry) / risk) if wall is not None and risk > 0 else None
+        runway_ok = runway_r is not None and runway_r >= CONFIG["min_runway_r"]
+        record_check("OI-wall runway", f"{runway_r:.2f}R to {wall}" if runway_r is not None else "no wall found",
+                     f">= {CONFIG['min_runway_r']:.2f}R to a detected wall", runway_ok)
+        runway_note = (f"runway {runway_r:.1f}R to wall {wall}" if runway_r is not None
+                       else "no option OI wall found")
+        (passes if runway_ok else fails).append(runway_note)
         cap = (wall - sign * 0.1 * a) if wall else None
         t1, t2 = entry + sign * CONFIG["t1_r"] * risk, entry + sign * CONFIG["t2_r"] * risk
         if cap is not None:
@@ -685,6 +781,13 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True):
         bid, ask = float(opt.get("top_bid_price") or 0), float(opt.get("top_ask_price") or 0)
         spread = (ask - bid) / prem * 100 if prem and ask and bid else None
         liquid_ok = prem > 0 and (opt.get("oi") or 0) > 0 and (spread is None or spread <= CONFIG["max_option_spread_pct"])
+        spread_current = f"{spread:.2f}%" if spread is not None else "not available"
+        liquidity_current = (f"premium {prem:.2f}; OI {opt.get('oi') or 0}; spread {spread_current}")
+        record_check(
+            "Option liquidity", liquidity_current,
+            f"premium > 0; OI > 0; spread <= {CONFIG['max_option_spread_pct']:.2f}% when bid/ask available",
+            liquid_ok,
+        )
         (passes if liquid_ok else fails).append(f"option liquidity (spread {spread if spread is None else round(spread,1)}%)")
         delta = abs(float(((opt.get("greeks") or {}).get("delta")) or 0.5)) or 0.5
         lot, opt_sid = lot_and_id(master, sym, prep["expiry"], opt_info["strike"], side)
@@ -702,6 +805,11 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True):
             "loss_per_lot_at_stop": r2(loss_lot),
             "loss_pct_of_capital": r2(loss_lot / CONFIG["capital"] * 100) if loss_lot else None,
         }
+    else:
+        record_check("OI-wall runway", "option-chain data unavailable", f">= {CONFIG['min_runway_r']:.2f}R", False)
+        record_check("Option liquidity", "option-chain data unavailable",
+                     f"premium > 0; OI > 0; spread <= {CONFIG['max_option_spread_pct']:.2f}% when bid/ask available",
+                     False)
     res["plan"] = plan
 
     # 6. quality/conviction factors. These feed the script's own BUY recommendation below (same
@@ -727,9 +835,9 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True):
     # VALIDATE that already-made recommendation against catalyst/news, cross-candidate
     # correlation and regime - things the script can't check - not to originate the call itself.
     mechanical_gates = {
-        "room left (ATR used)": used <= CONFIG["max_atr_used"],
-        "fresh trigger": triggered,
-        "not already chased": chase_pct <= CONFIG["max_chase_pct"],
+        "room left (ATR used)": atr_ok,
+        "fresh trigger": trigger_ok,
+        "not already chased": chase_ok,
         "breakout volume": vol_ok,
         "within entry window": time_ok,
         "runway to next OI wall": runway_ok,
@@ -754,8 +862,10 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True):
             verdict = f"SKIP_{side}"
             fails.append("over max risk per trade (block_over_risk is on)")
     if verdict.startswith("WATCH"):
+        cutoff_note = (f"before {CONFIG['extended_entry_cutoff']} (extended cutoff)" if ignore_entry_cutoff
+                       else f"before {CONFIG['entry_cutoff']}")
         res["watch_note"] = (f"Trigger: 5-min close {'above' if side=='CE' else 'below'} {level:.2f} "
-                             f"with volume > avg of prior 3 candles, before {CONFIG['entry_cutoff']}")
+                             f"with volume > avg of prior 3 candles, {cutoff_note}")
     if verdict.startswith("BUY"):
         res["valid_range"] = [r2(level), r2(level * (1 + sign * CONFIG["max_chase_pct"] / 100))]
         res["rules"] = "Exit by 15:15. Move stop to entry after T1. Skip if price is already beyond valid_range."
@@ -788,7 +898,8 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True):
 # --------------------------------------------------------------------------------------
 # One scan
 # --------------------------------------------------------------------------------------
-def scan(dh, master, prep, day, exclude, fired, universe=None):
+def scan(dh, master, prep, day, exclude, fired, universe=None, ignore_entry_cutoff=False,
+         live_orders_enabled=False):
     now = dt.datetime.now(IST)
     syms = [s for s in (universe or prep["stocks"]) if s in prep["stocks"] and s not in exclude]
     quotes = dh.ohlc({"NSE_EQ": [prep["stocks"][s]["sid"] for s in syms], "IDX_I": [NIFTY_ID]})
@@ -820,7 +931,8 @@ def scan(dh, master, prep, day, exclude, fired, universe=None):
     results = []
     for _, s, side, q in pre:
         try:
-            results.append(evaluate(dh, master, prep, s, side, q, nifty, now, day))
+            results.append(evaluate(dh, master, prep, s, side, q, nifty, now, day,
+                                   ignore_entry_cutoff=ignore_entry_cutoff))
         except DhanAuthError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -845,13 +957,21 @@ def scan(dh, master, prep, day, exclude, fired, universe=None):
         if r["verdict"].startswith("BUY") and key not in fired:
             fired.add(key)
             new_signals.append(r)
-            signal = {"type": "SIGNAL", "scan_time": snapshot["scan_time"], "nifty": nifty, **r}
+            order_state = {"status": "DISABLED"}
+            if live_orders_enabled:
+                order_state = {"status": "ARMED"}
+            signal = {"type": "SIGNAL", "scan_time": snapshot["scan_time"], "nifty": nifty,
+                      "execution": order_state, **r}
             with open(OUT / f"signals_{day}.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps(signal) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
             print("\n=========== RECOMMENDATION FOR AI VALIDATION (copy from here) ===========")
             print(json.dumps(signal, indent=2))
             print("=========== END RECOMMENDATION - script says BUY, AI must validate it ===========\n")
-            notify(r)
+            if live_orders_enabled:
+                order_state = submit_live_order(dh, r, day)
+            notify(r, order_state)
     if new_signals:
         # One batch per scan, every new recommendation together, so the cross-recommendation
         # correlation and regime checks in "ai_validation" actually have something to compare.
@@ -866,6 +986,7 @@ def scan(dh, master, prep, day, exclude, fired, universe=None):
         print("\n=========== AI VALIDATION BATCH (all new recommendations this scan, copy from here) ===========")
         print(json.dumps(batch, indent=2))
         print("=========== END AI VALIDATION BATCH ===========\n")
+    notify_scan_completion(snapshot)
     return snapshot
 
 
@@ -876,20 +997,43 @@ def print_scan(snap):
     if not snap["results"]:
         print("  no stock near a box edge with room left")
         return
+    visible_results = []
+    hidden_count = 0
+    for result in snap["results"]:
+        factor_values = result.get("factors")
+        if factor_values is not None:
+            quality_count = sum(value is True for value in factor_values.values())
+            if quality_count < MIN_DISPLAY_QUALITY:
+                hidden_count += 1
+                continue
+        visible_results.append(result)
+
+    if not visible_results:
+        print(f"  no rows with QUAL >= {MIN_DISPLAY_QUALITY}/5 "
+              f"({hidden_count} row(s) hidden below the display threshold)")
+        return
+
+    print(f"  Showing rows with QUAL >= {MIN_DISPLAY_QUALITY}/5")
     print(f"  {'VERDICT':8} {'SYMBOL':11} {'LTP':>9} {'LEVEL':>9} {'TOGO%':>6} {'ATR%':>5} {'VOLx':>5} {'QUAL':>5}  WHY NOT")
-    for r in snap["results"]:
+    for r in visible_results:
         fails = "; ".join(r.get("fails", [])[:3])
         print(f"  {r['verdict']:8} {r['symbol']:11} {r.get('ltp') or '':>9} {r.get('trigger_level') or '':>9} "
               f"{r.get('dist_to_trigger_pct') if r.get('dist_to_trigger_pct') is not None else '':>6} "
               f"{r.get('atr_used_pct') or '':>5} {r.get('vol_vs_prev3') or '':>5} "
               f"{(r.get('quality_score') or '')[:5]:>5}  {fails}")
+        for check in r.get("mechanical_checks", []):
+            status = "PASS" if check["passed"] else "FAIL"
+            print(f"      {status}: {check['gate']} | current: {check['current']} | required: {check['criterion']}")
+    if hidden_count:
+        print(f"  ({hidden_count} row(s) hidden below {MIN_DISPLAY_QUALITY}/5 quality)")
 
 
-def notify(r):
+def notify(r, order_state=None):
     """Beep + optional Telegram (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID).
     This is the script's own BUY recommendation - still needs AI/human validation (ai_validation)
     against catalyst/news and cross-recommendation overlap before you act on it."""
     print("\a", end="")
+    load_env()
     tok, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     if not (tok and chat):
         return
@@ -900,24 +1044,181 @@ def notify(r):
             f"Stop {p.get('stop')} / prem {o.get('premium_stop')} | T1 {p.get('t1')} / {o.get('premium_t1')} | "
             f"T2 {p.get('t2')} / {o.get('premium_t2')}\nLoss/lot {o.get('loss_per_lot_at_stop')} "
             f"{r.get('risk_warning', '')}")
+    if order_state:
+        text += f"\nOrder: {order_state['status']}"
+        if order_state.get("order_id"):
+            text += f" (Dhan ID {order_state['order_id']}, {order_state.get('order_status', 'status unknown')})"
+        if order_state.get("reason"):
+            text += f" - {order_state['reason']}"
+    send_telegram_message(tok, chat, text)
+
+
+def notify_scan_completion(snapshot):
+    """Send a concise Telegram summary after each successfully completed scan."""
+    load_env()
+    tok, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if not (tok and chat):
+        return
+
+    results = snapshot["results"]
+    counts = {
+        verdict: sum(result["verdict"].startswith(verdict) for result in results)
+        for verdict in ("BUY", "WATCH", "SKIP")
+    }
+    lines = [
+        f"Scan complete - {snapshot['scan_time']} IST",
+        f"Candidates: {snapshot['candidates_checked']}",
+        f"BUY: {counts['BUY']} | WATCH: {counts['WATCH']} | SKIP: {counts['SKIP']}",
+    ]
+    buys = [result for result in results if result["verdict"].startswith("BUY")]
+    if buys:
+        lines.append("BUY signals:")
+        lines.extend(
+            f"{result['verdict']} {result['symbol']} @ {result.get('ltp')}"
+            for result in buys
+        )
+    else:
+        lines.append("No BUY signals this scan.")
+
+    nifty = snapshot.get("nifty") or {}
+    lines.append(f"Nifty: {nifty.get('ltp')} ({nifty.get('chg_pct')}%), bias {nifty.get('bias')}")
+    send_telegram_message(tok, chat, "\n".join(lines))
+
+
+def send_telegram_message(token, chat_id, text):
     try:
-        requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", json={"chat_id": chat, "text": text},
-                      timeout=10)
-    except Exception:  # noqa: BLE001
-        pass
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=10,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        print(f"Telegram notification failed ({type(exc).__name__}); check bot credentials and connectivity.",
+              file=sys.stderr)
+        return
+
+    try:
+        result = response.json()
+    except ValueError:
+        print("Telegram notification failed: API returned invalid JSON.", file=sys.stderr)
+        return
+    if not isinstance(result, dict):
+        print("Telegram notification failed: API returned an unexpected response.", file=sys.stderr)
+        return
+    if not result.get("ok"):
+        description = result.get("description", "unknown Telegram API error")
+        print(f"Telegram notification failed: {description}", file=sys.stderr)
+
+
+def build_order_payload(r, client_id, day):
+    side = r.get("side")
+    option = r.get("option") or {}
+    if r.get("verdict") != f"BUY_{side}" or side not in ("CE", "PE"):
+        raise ValueError("only BUY_CE and BUY_PE signals can be submitted")
+    if r.get("risk_warning"):
+        raise ValueError(f"signal exceeds the configured one-lot risk limit: {r['risk_warning']}")
+    security_id = option.get("security_id")
+    lot_size = option.get("lot_size")
+    ask = option.get("ask")
+    if not security_id or not str(security_id).isdigit():
+        raise ValueError("exact option security ID is unavailable from the Dhan scrip master")
+    if not isinstance(lot_size, int) or lot_size <= 0:
+        raise ValueError("valid option lot size is unavailable")
+    if option.get("type") != side:
+        raise ValueError("selected option type does not match the recommendation")
+    if not isinstance(ask, (int, float)) or not math.isfinite(ask) or ask <= 0:
+        raise ValueError("a valid current option ask price is unavailable")
+    if ask * lot_size > CONFIG["capital"]:
+        raise ValueError("one-lot premium cost exceeds CONFIG['capital']")
+
+    signal_key = f"{day}:{r.get('symbol')}:{side}"
+    correlation_id = "bs" + hashlib.sha256(signal_key.encode("utf-8")).hexdigest()[:16]
+    return {
+        "dhanClientId": str(client_id),
+        "correlationId": correlation_id,
+        "transactionType": "BUY",
+        "exchangeSegment": "NSE_FNO",
+        "productType": "INTRADAY",
+        "orderType": "LIMIT",
+        "validity": "DAY",
+        "securityId": str(security_id),
+        "quantity": lot_size,
+        "disclosedQuantity": 0,
+        "price": float(ask),
+        "triggerPrice": 0,
+        "afterMarketOrder": False,
+        "amoTime": "",
+    }
+
+
+def append_order_event(day, event):
+    path = OUT / f"orders_{day}.jsonl"
+    OUT.mkdir(exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def submit_live_order(dh, r, day):
+    """Place one lot once; ambiguous API errors are logged, never retried automatically."""
+    try:
+        payload = build_order_payload(r, dh.client_id, day)
+    except ValueError as exc:
+        state = {"status": "BLOCKED", "reason": str(exc)}
+        append_order_event(day, {"time": dt.datetime.now(IST).isoformat(), "symbol": r["symbol"],
+                                 "side": r["side"], **state})
+        print(f"  order blocked for {r['symbol']} {r['side']}: {exc}", file=sys.stderr)
+        return state
+
+    correlation_id = payload["correlationId"]
+    attempt = {
+        "time": dt.datetime.now(IST).isoformat(),
+        "symbol": r["symbol"],
+        "side": r["side"],
+        "correlation_id": correlation_id,
+        "security_id": payload["securityId"],
+        "quantity": payload["quantity"],
+        "limit_price": payload["price"],
+        "status": "SUBMITTING",
+    }
+    append_order_event(day, attempt)
+    try:
+        response = dh.place_order(payload)
+    except (requests.RequestException, RuntimeError) as exc:
+        state = {"status": "UNKNOWN", "reason": type(exc).__name__, "correlation_id": correlation_id}
+        print(f"  order submission outcome unknown for {r['symbol']} {r['side']} "
+              f"({type(exc).__name__}); check Dhan order book before taking action.",
+              file=sys.stderr)
+    else:
+        order_status = str(response.get("orderStatus") or "UNKNOWN")
+        state = {
+            "status": "REJECTED" if order_status == "REJECTED" else "SUBMITTED",
+            "order_id": str(response["orderId"]),
+            "order_status": order_status,
+            "correlation_id": correlation_id,
+        }
+        if state["status"] == "REJECTED":
+            state["reason"] = "Dhan rejected the order"
+    append_order_event(day, {"time": dt.datetime.now(IST).isoformat(), "symbol": r["symbol"],
+                             "side": r["side"], **state})
+    return state
 
 
 # --------------------------------------------------------------------------------------
 # Main loop
 # --------------------------------------------------------------------------------------
+def load_env():
+    """Load optional .env values without overriding explicitly exported environment variables."""
+    load_dotenv(dotenv_path=ENV_FILE, override=False)
+
+
 def credentials():
+    load_env()
     cid, tok = os.getenv("DHAN_CLIENT_ID"), os.getenv("DHAN_ACCESS_TOKEN")
-    cfg = Path(__file__).resolve().parent / "config.json"
-    if (not cid or not tok) and cfg.exists():
-        c = json.loads(cfg.read_text())
-        cid, tok = cid or c.get("client_id"), tok or c.get("access_token")
     if not cid or not tok:
-        sys.exit("Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN (or config.json). See the top of this file.")
+        sys.exit("Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in .env or the process environment.")
     return cid, tok
 
 
@@ -926,15 +1227,35 @@ def hm(s):
     return dt.time(h, m)
 
 
+def is_entry_time(now: dt.datetime, ignore_entry_cutoff: bool = False) -> bool:
+    current = now.strftime("%H:%M")
+    cutoff = (CONFIG["extended_entry_cutoff"] if ignore_entry_cutoff
+              else CONFIG["entry_cutoff"])
+    return CONFIG["entry_start"] <= current <= cutoff
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Intraday box-breakout scanner (Dhan API, read-only)")
+    ap = argparse.ArgumentParser(description="Intraday box-breakout scanner (Dhan API)")
     ap.add_argument("--once", action="store_true", help="run one scan now and exit")
+    ap.add_argument("--ignore-entry-cutoff", action="store_true",
+                    help="extend entry cutoff to 15:25 IST and keep scheduled scans running until 15:30")
     ap.add_argument("--exclude", default="", help="comma-separated symbols to skip (results today, F&O ban)")
     ap.add_argument("--universe", default="nifty50",
                     help="which stocks: nifty50 (default), niftynext50, nifty100, nifty200, fno (all F&O stocks), "
                          "watchlist (built-in list); combine with commas, e.g. nifty50,watchlist")
+    ap.add_argument("--enable-live-orders", action="store_true",
+                    help="allow live Dhan orders only when ENABLE_LIVE_ORDERS=true in .env")
     args = ap.parse_args()
     exclude = {s.strip().upper() for s in args.exclude.split(",") if s.strip()}
+
+    load_env()
+    live_orders_enabled = (
+        args.enable_live_orders
+        and os.getenv("ENABLE_LIVE_ORDERS", "").strip().lower() in {"1", "true", "yes", "on"}
+    )
+    if args.enable_live_orders and not live_orders_enabled:
+        print("Live order submission remains disabled: set ENABLE_LIVE_ORDERS=true in .env "
+              "as well as passing --enable-live-orders.")
 
     dh = Dhan(*credentials())
     day = dt.datetime.now(IST).date()
@@ -951,15 +1272,29 @@ def main():
                 fired.add(f"{j['symbol']}_{j['side']}")
 
         if args.once:
-            t = dt.datetime.now(IST).strftime("%H:%M")
-            if not (CONFIG["entry_start"] <= t <= CONFIG["entry_cutoff"]):
-                print(f"Note: {t} is outside the entry window {CONFIG['entry_start']}-{CONFIG['entry_cutoff']}, "
+            now = dt.datetime.now(IST)
+            t = now.strftime("%H:%M")
+            entry_cutoff = (CONFIG["extended_entry_cutoff"] if args.ignore_entry_cutoff
+                            else CONFIG["entry_cutoff"])
+            if not is_entry_time(now, args.ignore_entry_cutoff):
+                print(f"Note: {t} is outside the entry window {CONFIG['entry_start']}-{entry_cutoff}, "
                       "so every result will be SKIP (time). This run only tests data and levels.")
-            scan(dh, master, prep, day, exclude, fired, universe)
+            elif args.ignore_entry_cutoff and t > CONFIG["entry_cutoff"]:
+                print(f"Note: {t} is after the usual {CONFIG['entry_cutoff']} cutoff; "
+                      f"the extended cutoff {entry_cutoff} is active for this run.")
+            scan(dh, master, prep, day, exclude, fired, universe,
+                 ignore_entry_cutoff=args.ignore_entry_cutoff,
+                 live_orders_enabled=live_orders_enabled)
             return
 
-        start, end = hm(CONFIG["run_start"]), hm(CONFIG["run_end"])
-        print(f"Scanner running {CONFIG['run_start']}-{CONFIG['run_end']} IST, every 5 min. Ctrl+C to stop.")
+        start = hm(CONFIG["run_start"])
+        end_text = CONFIG["extended_run_end"] if args.ignore_entry_cutoff else CONFIG["run_end"]
+        end = hm(end_text)
+        if args.ignore_entry_cutoff:
+            print(f"Scanner running {CONFIG['run_start']}-{end_text} IST, every 5 min; "
+                  f"entry cutoff extended to {CONFIG['extended_entry_cutoff']}. Ctrl+C to stop.")
+        else:
+            print(f"Scanner running {CONFIG['run_start']}-{end_text} IST, every 5 min. Ctrl+C to stop.")
         while True:
             now = dt.datetime.now(IST)
             if now.time() > end:
@@ -971,10 +1306,17 @@ def main():
             if now.time() < start:
                 nxt = max(nxt, dt.datetime.combine(day, start, IST))
             time.sleep(max(1, (nxt - dt.datetime.now(IST)).total_seconds()))
-            if dt.datetime.now(IST).time() < start:
+            after_sleep = dt.datetime.now(IST)
+            if after_sleep.time() < start:
                 continue
+            scheduled_end = dt.datetime.combine(day, end, IST)
+            if after_sleep > scheduled_end:
+                print("Past run_end - stopping. Signals today:", sorted(fired) or "none")
+                return
             try:
-                scan(dh, master, prep, day, exclude, fired, universe)
+                scan(dh, master, prep, day, exclude, fired, universe,
+                     ignore_entry_cutoff=args.ignore_entry_cutoff,
+                     live_orders_enabled=live_orders_enabled)
             except DhanAuthError:
                 raise
             except requests.RequestException as e:
