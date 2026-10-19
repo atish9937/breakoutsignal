@@ -1,15 +1,26 @@
+import base64
+import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import requests
+from dotenv import dotenv_values
 
 import breakout_scanner as scanner
 
 
 class TelegramNotificationTests(unittest.TestCase):
+    @staticmethod
+    def make_token(expiry):
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"exp": expiry}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        return f"header.{payload}.signature"
+
     def setUp(self):
         self.signal = {
             "verdict": "BUY_CE",
@@ -53,6 +64,129 @@ class TelegramNotificationTests(unittest.TestCase):
             with patch.object(scanner, "ENV_FILE", env_file):
                 with patch.dict(os.environ, {}, clear=True):
                     self.assertEqual(scanner.credentials(), ("client", "token"))
+
+    @patch.object(scanner.requests, "get")
+    def test_renews_active_web_token_and_persists_new_value(self, get):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_file = Path(temp_dir) / ".env"
+            env_file.write_text(
+                "DHAN_CLIENT_ID=client\nDHAN_ACCESS_TOKEN=old-token\nTELEGRAM_CHAT_ID=@alerts\n",
+                encoding="utf-8",
+            )
+            response = Mock()
+            response.json.return_value = {"accessToken": "new-token", "expiryTime": "later"}
+            get.return_value = response
+            with patch.object(scanner, "ENV_FILE", env_file):
+                with patch.dict(
+                    os.environ,
+                    {"DHAN_CLIENT_ID": "client", "DHAN_ACCESS_TOKEN": "old-token"},
+                    clear=True,
+                ):
+                    token = scanner.renew_dhan_access_token("client", "old-token")
+                    self.assertEqual(os.environ["DHAN_ACCESS_TOKEN"], "new-token")
+
+            self.assertEqual(token, "new-token")
+            self.assertEqual(dotenv_values(env_file)["DHAN_ACCESS_TOKEN"], "new-token")
+            self.assertEqual(dotenv_values(env_file)["TELEGRAM_CHAT_ID"], "@alerts")
+            get.assert_called_once_with(
+                f"{scanner.API}/RenewToken",
+                headers={"access-token": "old-token", "dhanClientId": "client"},
+                timeout=20,
+            )
+
+    @patch.object(scanner.requests, "get")
+    def test_refuses_to_renew_environment_token_that_differs_from_dotenv(self, get):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_file = Path(temp_dir) / ".env"
+            env_file.write_text("DHAN_ACCESS_TOKEN=file-token\n", encoding="utf-8")
+            with patch.object(scanner, "ENV_FILE", env_file):
+                with self.assertRaisesRegex(RuntimeError, "remove any overriding"):
+                    scanner.renew_dhan_access_token("client", "exported-token")
+
+        get.assert_not_called()
+
+    @patch.object(scanner.requests, "get")
+    def test_failed_renewal_keeps_original_dotenv_token(self, get):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_file = Path(temp_dir) / ".env"
+            env_file.write_text("DHAN_ACCESS_TOKEN=expired-token\n", encoding="utf-8")
+            response = Mock(status_code=401)
+            response.raise_for_status.side_effect = requests.HTTPError(
+                "unauthorized", response=response
+            )
+            get.return_value = response
+            with patch.object(scanner, "ENV_FILE", env_file):
+                with self.assertRaisesRegex(RuntimeError, r"token renewal failed \(HTTP 401\)"):
+                    scanner.renew_dhan_access_token("client", "expired-token")
+
+            self.assertEqual(dotenv_values(env_file)["DHAN_ACCESS_TOKEN"], "expired-token")
+
+    @patch.object(scanner, "renew_dhan_access_token")
+    def test_credentials_renews_when_enabled_in_env(self, renew):
+        renew.return_value = "rotated-token"
+        token = self.make_token(time.time() + 60 * 60)
+        with patch.dict(
+            os.environ,
+            {
+                "DHAN_CLIENT_ID": "client",
+                "DHAN_ACCESS_TOKEN": token,
+                "AUTO_RENEW_DHAN_TOKEN": "true",
+            },
+            clear=True,
+        ):
+            self.assertEqual(scanner.credentials(), ("client", "rotated-token"))
+        renew.assert_called_once_with("client", token)
+
+    @patch.object(scanner, "renew_dhan_access_token")
+    def test_credentials_reuses_token_with_more_than_thirteen_hours_remaining(self, renew):
+        token = self.make_token(time.time() + 14 * 60 * 60)
+        with patch.dict(
+            os.environ,
+            {
+                "DHAN_CLIENT_ID": "client",
+                "DHAN_ACCESS_TOKEN": token,
+                "AUTO_RENEW_DHAN_TOKEN": "true",
+            },
+            clear=True,
+        ):
+            self.assertEqual(scanner.credentials(), ("client", token))
+        renew.assert_not_called()
+
+    def test_token_expiry_window_uses_jwt_expiry(self):
+        token = self.make_token(time.time() + 30 * 60)
+
+        self.assertTrue(scanner.token_expires_within(token, 60 * 60))
+        self.assertFalse(scanner.token_expires_within(token, 15 * 60))
+
+    def test_token_expiring_within_thirteen_hours_is_due_for_renewal(self):
+        token = self.make_token(time.time() + 12 * 60 * 60)
+
+        self.assertTrue(
+            scanner.token_expires_within(token, scanner.TOKEN_RENEWAL_WINDOW_SECONDS)
+        )
+
+    def test_renewal_response_error_reports_field_names_not_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_file = Path(temp_dir) / ".env"
+            env_file.write_text("DHAN_ACCESS_TOKEN=active-token\n", encoding="utf-8")
+            response = Mock()
+            response.json.return_value = {"status": "success", "message": "secret-response"}
+            with patch.object(scanner, "ENV_FILE", env_file):
+                with patch.object(scanner.requests, "get", return_value=response):
+                    with self.assertRaisesRegex(
+                        RuntimeError, r"response fields: message, status"
+                    ) as raised:
+                        scanner.renew_dhan_access_token("client", "active-token")
+
+        self.assertNotIn("secret-response", str(raised.exception))
+
+    @patch.object(scanner, "credentials")
+    def test_renew_token_only_exits_without_starting_a_scan(self, credentials):
+        with patch.dict(os.environ, {"AUTO_RENEW_DHAN_TOKEN": "true"}, clear=True):
+            with patch("sys.argv", ["breakout_scanner.py", "--renew-token-only"]):
+                scanner.main()
+
+        credentials.assert_called_once_with()
 
     @patch.object(scanner.requests, "post")
     def test_sends_new_signal_to_telegram(self, post):

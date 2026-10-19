@@ -33,13 +33,22 @@ SETUP (one time)
       Mac/Linux:             export DHAN_CLIENT_ID=1100xxxxxx; export DHAN_ACCESS_TOKEN=eyJ...
     (or copy .env.example to .env next to this file and set DHAN_CLIENT_ID and
     DHAN_ACCESS_TOKEN there; keep .env private with chmod 600)
+    To renew Dhan Web-generated active tokens automatically when they are within 13 hours
+    of expiry, set AUTO_RENEW_DHAN_TOKEN=true. The scanner reuses a token that is not near
+    expiry, avoiding token rotation on every run. Renewal updates .env; expired tokens cannot
+    be renewed. Keep the credentials in .env (not just exported variables) for persistence.
+    API-key OAuth tokens are not supported by this renewal flow.
     To receive Telegram alerts for new BUY recommendations, create a bot with @BotFather,
     get your chat ID, then set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the environment
     or add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to .env; see .env.example.
     For a channel, add the bot as an administrator with permission to post;
     use @public_channel_name for a public channel or the -100... chat ID for a private channel.
     Telegram is optional; the scanner still beeps when it is not configured.
-    The access token expires every 24 h - paste a fresh one each morning.
+    Dhan Web tokens expire after 24 h. With automatic renewal enabled, the scanner requests a
+    replacement when it starts with 13 hours or less remaining and saves it into .env. Start the
+    scanner before the token expires; once-daily runs can miss the window if they happen at or
+    after expiry. If the token expires, enter a fresh Dhan Web token in .env. For a manual
+    check/renewal, stop the scanner and run run.bat --renew-token-only before expiry.
     LIVE ORDER EXECUTION (optional, off unless explicitly enabled)
     Dhan order placement requires a static IP whitelisted in Dhan. Set
     ENABLE_LIVE_ORDERS=true in .env AND pass --enable-live-orders to submit
@@ -52,7 +61,9 @@ SETUP (one time)
 UNIX / CRON
     python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
     cp .env.example .env && chmod 600 .env
-    Edit .env with Dhan credentials. For live orders, ENABLE_LIVE_ORDERS=true must be
+    Edit .env with Dhan credentials. Set AUTO_RENEW_DHAN_TOKEN=true to renew the active
+    Dhan Web token only when within 13 hours of expiry. For live orders,
+    ENABLE_LIVE_ORDERS=true must be
     set and the cron command must include --enable-live-orders.
     Run run_unix.sh --once to test scanning without submitting orders.
     chmod +x run_unix.sh
@@ -65,6 +76,12 @@ UNIX / CRON
     CRON_TZ sets the schedule timezone on cron implementations that support it, so the server
     timezone does not need to be changed. The script uses flock to prevent overlapping runs.
     Create scanner_out before adding the cron entry so the log redirection can open its file.
+    Dhan tokens expire after 24 hours. To keep the token active across weekends and scanner
+    downtime, add this all-days maintenance schedule (keep AUTO_RENEW_DHAN_TOKEN=true):
+      0 6,18 * * * /var/www/breakoutsignal/run_unix.sh --renew-token-only >> /var/www/breakoutsignal/scanner_out/token-renewal.log 2>&1
+    The 12-hour cadence and 13-hour renewal window leave a one-hour safety margin; these runs are
+    outside scanner hours. If a renewal is missed until after expiry, generate a fresh Dhan Web
+    access token and replace it in .env.
     Dhan order APIs require a static IP whitelisted in Dhan.
 
 RUN
@@ -110,6 +127,7 @@ Research tool, not SEBI-registered investment advice. Verify every level on your
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import json
@@ -121,7 +139,7 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv, set_key
 
 # --------------------------------------------------------------------------------------
 # SETTINGS - change these to suit you
@@ -196,6 +214,7 @@ SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 OUT = Path(__file__).resolve().parent / "scanner_out"
 ENV_FILE = Path(__file__).resolve().parent / ".env"
+TOKEN_RENEWAL_WINDOW_SECONDS = 13 * 60 * 60
 
 
 # --------------------------------------------------------------------------------------
@@ -1226,7 +1245,96 @@ def credentials():
     cid, tok = os.getenv("DHAN_CLIENT_ID"), os.getenv("DHAN_ACCESS_TOKEN")
     if not cid or not tok:
         sys.exit("Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in .env or the process environment.")
+    if (os.getenv("AUTO_RENEW_DHAN_TOKEN", "").strip().lower() in {"1", "true", "yes", "on"}
+            and token_expires_within(tok, TOKEN_RENEWAL_WINDOW_SECONDS)):
+        try:
+            tok = renew_dhan_access_token(cid, tok)
+        except RuntimeError as exc:
+            sys.exit(str(exc))
+        print("Dhan access token renewed and saved to .env.")
     return cid, tok
+
+
+def token_expires_within(access_token, seconds):
+    """Read JWT exp for renewal scheduling; this does not validate the token's signature."""
+    parts = access_token.split(".")
+    if len(parts) != 3:
+        raise RuntimeError("Cannot determine Dhan token expiry; provide a valid JWT access token")
+    try:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("Cannot read Dhan token expiry from its JWT payload") from exc
+    expiry = claims.get("exp") if isinstance(claims, dict) else None
+    if not isinstance(expiry, (int, float)):
+        raise RuntimeError("Dhan token JWT does not contain a numeric expiry; cannot schedule renewal safely")
+    return expiry - time.time() <= seconds
+
+
+def renew_dhan_access_token(client_id, access_token):
+    """Renew an active Dhan Web token once and persist the replacement into .env."""
+    if not ENV_FILE.is_file():
+        raise RuntimeError("AUTO_RENEW_DHAN_TOKEN requires credentials to be stored in the local .env file")
+
+    env_values = dotenv_values(ENV_FILE)
+    if env_values.get("DHAN_ACCESS_TOKEN") != access_token:
+        raise RuntimeError(
+            "AUTO_RENEW_DHAN_TOKEN requires DHAN_ACCESS_TOKEN in .env to match the active token; "
+            "remove any overriding DHAN_ACCESS_TOKEN from the process environment"
+        )
+    if os.name == "posix":
+        os.chmod(ENV_FILE, 0o600)
+
+    try:
+        response = requests.get(
+            f"{API}/RenewToken",
+            headers={"access-token": access_token, "dhanClientId": str(client_id)},
+            timeout=20,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        status_note = f" (HTTP {status})" if status is not None else ""
+        raise RuntimeError(
+            f"Dhan token renewal failed{status_note} ({type(exc).__name__}); "
+            "ensure it is an unexpired Dhan Web-generated token"
+        ) from exc
+
+    try:
+        result = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Dhan token renewal returned invalid JSON") from exc
+    if isinstance(result, dict):
+        token_data = result.get("data") if isinstance(result.get("data"), dict) else result
+        new_token = token_data.get("accessToken") or token_data.get("access_token")
+        if not isinstance(new_token, str):
+            fields = ", ".join(sorted(str(key) for key in result))
+            nested = result.get("data")
+            if isinstance(nested, dict):
+                fields += f"; data fields: {', '.join(sorted(str(key) for key in nested))}"
+            raise RuntimeError(
+                f"Dhan token renewal returned HTTP 200 without an access token "
+                f"(response fields: {fields or 'none'}); the existing .env token was not changed"
+            )
+    else:
+        raise RuntimeError(
+            f"Dhan token renewal returned unexpected response type {type(result).__name__}; "
+            "the existing .env token was not changed"
+        )
+    new_token = new_token.strip()
+    if not new_token or new_token == access_token:
+        raise RuntimeError("Dhan token renewal returned an empty or unchanged access token")
+
+    success, key, _ = set_key(
+        str(ENV_FILE),
+        "DHAN_ACCESS_TOKEN",
+        new_token,
+        quote_mode="always",
+    )
+    if not success or key != "DHAN_ACCESS_TOKEN":
+        raise RuntimeError("Could not persist the renewed token to .env")
+    os.environ["DHAN_ACCESS_TOKEN"] = new_token
+    return new_token
 
 
 def hm(s):
@@ -1252,10 +1360,21 @@ def main():
                          "watchlist (built-in list); combine with commas, e.g. nifty50,watchlist")
     ap.add_argument("--enable-live-orders", action="store_true",
                     help="allow live Dhan orders only when ENABLE_LIVE_ORDERS=true in .env")
+    ap.add_argument("--renew-token-only", action="store_true",
+                    help="renew the active Dhan Web token if near expiry, save it to .env, and exit")
     args = ap.parse_args()
     exclude = {s.strip().upper() for s in args.exclude.split(",") if s.strip()}
 
     load_env()
+    if args.renew_token_only:
+        if os.getenv("AUTO_RENEW_DHAN_TOKEN", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            sys.exit("--renew-token-only requires AUTO_RENEW_DHAN_TOKEN=true in .env")
+        current_token = os.getenv("DHAN_ACCESS_TOKEN")
+        credentials()
+        if os.getenv("DHAN_ACCESS_TOKEN") == current_token:
+            print("Dhan access token is valid; renewal is not due yet.")
+        return
+
     live_orders_enabled = (
         args.enable_live_orders
         and os.getenv("ENABLE_LIVE_ORDERS", "").strip().lower() in {"1", "true", "yes", "on"}
