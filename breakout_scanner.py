@@ -56,9 +56,16 @@ UNIX / CRON
     set and the cron command must include --enable-live-orders.
     Run run_unix.sh --once to test scanning without submitting orders.
     chmod +x run_unix.sh
-    Schedule run_unix.sh --once every 5 minutes during NSE entry hours, with scanner_out/cron.log
-    as the log. The script uses flock to skip overlapping cron runs. Configure the server/cron
-    timezone as Asia/Kolkata. Dhan order APIs require a static IP whitelisted in Dhan.
+    The scanner has its own 5-minute loop. Add one daily cron entry (do not pass --once):
+      CRON_TZ=Asia/Kolkata
+      0 9 * * 1-5 /var/www/breakoutsignal/run_unix.sh >> /var/www/breakoutsignal/scanner_out/cron.log 2>&1
+    This starts it at 09:00 IST; it waits until 09:20, then scans every 5 minutes through
+    12:35 IST (entry cutoff 12:30). To run through market close, add --ignore-entry-cutoff
+    to the command; it then scans through 15:30 with entry cutoff 15:25.
+    CRON_TZ sets the schedule timezone on cron implementations that support it, so the server
+    timezone does not need to be changed. The script uses flock to prevent overlapping runs.
+    Create scanner_out before adding the cron entry so the log redirection can open its file.
+    Dhan order APIs require a static IP whitelisted in Dhan.
 
 RUN
     python breakout_scanner.py                  # runs 09:20-12:35 IST, scans every 5 min
