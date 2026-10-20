@@ -18,6 +18,12 @@ STRATEGY_START = dt.time(9, 20)
 STRATEGY_END = dt.time(12, 35)
 
 
+def cycle_end(ignore_entry_cutoff):
+    if ignore_entry_cutoff:
+        return breakout.hm(breakout.CONFIG["extended_run_end"])
+    return max(STRATEGY_END, breakout.hm(breakout.CONFIG["run_end"]))
+
+
 def load_fired_signals(path):
     fired = set()
     if path.exists():
@@ -27,23 +33,23 @@ def load_fired_signals(path):
     return fired
 
 
-def run_cycle(dh, master, prep, universe, exclude, trend_expiry, day, now, fired):
-    """Run every strategy for one candle-close using the same API client."""
-    scanners = (
-        (
-            "breakout",
-            breakout.scan,
-            (dh, master, prep, day, exclude, fired["breakout"], universe),
-            {"now": now},
-        ),
-        (
+def run_cycle(dh, master, prep, universe, exclude, trend_expiry, day, now, fired,
+              ignore_entry_cutoff=False):
+    """Run eligible strategies for one candle-close using the same API client."""
+    scanners = [(
+        "breakout",
+        breakout.scan,
+        (dh, master, prep, day, exclude, fired["breakout"], universe),
+        {"now": now, "ignore_entry_cutoff": ignore_entry_cutoff},
+    )]
+    if now.time() <= STRATEGY_END:
+        scanners.append((
             "trend_pullback",
             trend_pullback.scan,
             (dh, master, universe, exclude, trend_expiry, day, now,
              fired["trend_pullback"]),
             {},
-        ),
-    )
+        ))
     results = {}
     for name, scanner, args, kwargs in scanners:
         try:
@@ -62,6 +68,11 @@ def main():
         description="Run breakout and trend-pullback recommendations on one shared Dhan client"
     )
     parser.add_argument("--once", action="store_true", help="run one cycle of every strategy")
+    parser.add_argument(
+        "--ignore-entry-cutoff",
+        action="store_true",
+        help="extend breakout entries to 15:25 IST and keep breakout scans running until 15:30; trend-pullback keeps its normal cutoff",
+    )
     parser.add_argument("--universe", default="nifty50",
                         help="nifty50, niftynext50, nifty100, nifty200, fno, or watchlist")
     parser.add_argument("--exclude", default="", help="comma-separated symbols to skip")
@@ -84,15 +95,22 @@ def main():
 
     if args.once:
         run_cycle(dh, master, prep, universe, exclude, prep.get("expiry"), day,
-                  dt.datetime.now(breakout.IST), fired)
+                  dt.datetime.now(breakout.IST), fired, args.ignore_entry_cutoff)
         return
 
-    print("Running breakout and trend-pullback strategies every 5 minutes from "
-          "09:20-12:35 IST. Strategies share one Dhan client and request limiter; "
-          "no live orders are placed. Ctrl+C to stop.")
+    end = cycle_end(args.ignore_entry_cutoff)
+    if args.ignore_entry_cutoff:
+        print("Running breakout and trend-pullback strategies every 5 minutes from "
+              "09:20-12:35 IST; breakout only continues until 15:30 IST with its "
+              "entry cutoff extended to 15:25. Strategies share one Dhan client and "
+              "request limiter; no live orders are placed. Ctrl+C to stop.")
+    else:
+        print("Running breakout and trend-pullback strategies every 5 minutes from "
+              f"09:20-{end.strftime('%H:%M')} IST. Strategies share one Dhan client "
+              "and request limiter; no live orders are placed. Ctrl+C to stop.")
     while True:
         now = dt.datetime.now(breakout.IST)
-        if now.time() > STRATEGY_END:
+        if now.time() > end:
             print("All strategies finished for the day.")
             return
 
@@ -108,11 +126,11 @@ def main():
             )
         time.sleep(max(1, (next_run - dt.datetime.now(breakout.IST)).total_seconds()))
         cycle_time = dt.datetime.now(breakout.IST)
-        if cycle_time.time() > STRATEGY_END:
+        if cycle_time.time() > end:
             continue
         try:
             run_cycle(dh, master, prep, universe, exclude, prep.get("expiry"),
-                      day, cycle_time, fired)
+                      day, cycle_time, fired, args.ignore_entry_cutoff)
         except breakout.DhanAuthError as exc:
             sys.exit(f"Dhan rejected the token ({exc}). Check Dhan credentials and retry.")
         except requests.RequestException as exc:

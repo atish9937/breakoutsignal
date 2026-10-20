@@ -81,6 +81,10 @@ UNIX / CRON
     CRON_TZ sets the schedule timezone on cron implementations that support it, so the server
     timezone does not need to be changed. The script uses flock to prevent overlapping runs.
     Create scanner_out before adding the cron entry so the log redirection can open its file.
+    To extend breakout entries to 15:25 IST while keeping trend-pullback at its normal
+    12:30 entry cutoff, add --ignore-entry-cutoff to the combined runner cron command.
+    The combined process then continues breakout scans until 15:30 IST; trend-pullback
+    stops after its normal 12:35 schedule.
     Dhan tokens expire after 24 hours. To keep the token active across weekends and scanner
     downtime, add this all-days maintenance schedule (keep AUTO_RENEW_DHAN_TOKEN=true):
       0 6,18 * * * /var/www/breakoutsignal/run_unix.sh --renew-token-only >> /var/www/breakoutsignal/scanner_out/token-renewal.log 2>&1

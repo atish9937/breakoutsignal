@@ -33,7 +33,31 @@ class StrategyRunnerTests(unittest.TestCase):
         self.assertIs(scan_breakout.call_args.args[0], client)
         self.assertIs(scan_pullback.call_args.args[0], client)
         self.assertEqual(scan_breakout.call_args.kwargs["now"], now)
+        self.assertFalse(scan_breakout.call_args.kwargs["ignore_entry_cutoff"])
         self.assertEqual(scan_pullback.call_args.args[6], now)
+
+    def test_extended_breakout_window_does_not_extend_trend_pullback(self):
+        client = Mock()
+        prep = {"expiry": "2026-10-29"}
+        universe = {"AAA": 1}
+        day = dt.date(2026, 10, 19)
+        now = dt.datetime(2026, 10, 19, 14, 0, tzinfo=breakout.IST)
+        fired = {"breakout": set(), "trend_pullback": set()}
+
+        with patch.object(breakout, "scan", return_value={}) as scan_breakout:
+            with patch.object(trend_pullback, "scan") as scan_pullback:
+                result = strategy_runner.run_cycle(
+                    client, object(), prep, universe, set(), prep["expiry"], day, now,
+                    fired, ignore_entry_cutoff=True,
+                )
+
+        self.assertEqual(result, {"breakout": {}})
+        self.assertTrue(scan_breakout.call_args.kwargs["ignore_entry_cutoff"])
+        scan_pullback.assert_not_called()
+
+    def test_extended_cycle_end_uses_breakout_extended_run_end(self):
+        self.assertEqual(strategy_runner.cycle_end(True), dt.time(15, 30))
+        self.assertEqual(strategy_runner.cycle_end(False), dt.time(12, 35))
 
     def test_strategy_error_is_reported_and_next_strategy_still_runs(self):
         client = Mock()
