@@ -44,6 +44,9 @@ SETUP (one time)
     For a channel, add the bot as an administrator with permission to post;
     use @public_channel_name for a public channel or the -100... chat ID for a private channel.
     Telegram is optional; the scanner still beeps when it is not configured.
+    To run breakout and trend-pullback together on one shared Dhan client and API rate limiter,
+    use strategy_runner.py (Windows: run_all.bat; Unix: run_all_unix.sh). Do not start the
+    standalone scanner loops at the same time as the combined runner.
     Dhan Web tokens expire after 24 h. With automatic renewal enabled, the scanner requests a
     replacement when it starts with 13 hours or less remaining and saves it into .env. Start the
     scanner before the token expires; once-daily runs can miss the window if they happen at or
@@ -51,8 +54,9 @@ SETUP (one time)
     check/renewal, stop the scanner and run run.bat --renew-token-only before expiry.
     LIVE ORDER EXECUTION (optional, off unless explicitly enabled)
     Dhan order placement requires a static IP whitelisted in Dhan. Set
-    ENABLE_LIVE_ORDERS=true in .env AND pass --enable-live-orders to submit
-    one INTRADAY LIMIT buy at the selected option's current ask for each new BUY signal.
+    ENABLE_LIVE_ORDERS=true in .env AND pass --enable-live-orders to the standalone
+    breakout_scanner.py command to submit one INTRADAY LIMIT buy at the selected option's
+    current ask for each new BUY signal. strategy_runner.py is recommendations-only.
     The selected contract must have an exact scrip-master security ID and lot size.
     Limit orders may remain unfilled. This only submits entries; it does not manage exits.
     Live orders do not wait for the AI-validation checklist. Each symbol/side is attempted at
@@ -62,17 +66,18 @@ UNIX / CRON
     python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
     cp .env.example .env && chmod 600 .env
     Edit .env with Dhan credentials. Set AUTO_RENEW_DHAN_TOKEN=true to renew the active
-    Dhan Web token only when within 13 hours of expiry. For live orders,
-    ENABLE_LIVE_ORDERS=true must be
-    set and the cron command must include --enable-live-orders.
-    Run run_unix.sh --once to test scanning without submitting orders.
-    chmod +x run_unix.sh
-    The scanner has its own 5-minute loop. Add one daily cron entry (do not pass --once):
+    Dhan Web token only when within 13 hours of expiry. strategy_runner.py never places
+    live orders. Live orders are available only in the standalone breakout scanner when
+    ENABLE_LIVE_ORDERS=true is set and --enable-live-orders is passed.
+    Run run_all_unix.sh --once to test all strategies without submitting orders.
+    chmod +x run_unix.sh run_all_unix.sh
+    The combined runner has one shared 5-minute loop. Add one daily cron entry
+    (replace the old breakout-only scanner entry; do not run both):
       CRON_TZ=Asia/Kolkata
-      0 9 * * 1-5 /var/www/breakoutsignal/run_unix.sh >> /var/www/breakoutsignal/scanner_out/cron.log 2>&1
-    This starts it at 09:00 IST; it waits until 09:20, then scans every 5 minutes through
-    12:35 IST (entry cutoff 12:30). To run through market close, add --ignore-entry-cutoff
-    to the command; it then scans through 15:30 with entry cutoff 15:25.
+      0 9 * * 1-5 /var/www/breakoutsignal/run_all_unix.sh >> /var/www/breakoutsignal/scanner_out/cron.log 2>&1
+    This starts both strategies at 09:00 IST; they scan sequentially using one Dhan client
+    every five minutes from 09:20 through 12:35 IST (entry cutoff 12:30). Strategy
+    checks run one after another against the same candle-close time and shared API limiter.
     CRON_TZ sets the schedule timezone on cron implementations that support it, so the server
     timezone does not need to be changed. The script uses flock to prevent overlapping runs.
     Create scanner_out before adding the cron entry so the log redirection can open its file.
@@ -85,7 +90,9 @@ UNIX / CRON
     Dhan order APIs require a static IP whitelisted in Dhan.
 
 RUN
-    python breakout_scanner.py                  # runs 09:20-12:35 IST, scans every 5 min
+    python strategy_runner.py                   # breakout + trend pullback, shared client
+    python strategy_runner.py --once            # one cycle of both strategies
+    python breakout_scanner.py                  # breakout strategy only, standalone
     python breakout_scanner.py --once           # one scan now (for testing)
     python breakout_scanner.py --ignore-entry-cutoff  # extend entry cutoff to 15:25 IST; scan through market close
     python breakout_scanner.py --exclude TECHM,WIPRO   # skip stocks (results today / F&O ban)
@@ -134,6 +141,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -215,6 +223,7 @@ IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 OUT = Path(__file__).resolve().parent / "scanner_out"
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 TOKEN_RENEWAL_WINDOW_SECONDS = 13 * 60 * 60
+DHAN_DATA_MIN_REQUEST_GAP_SECONDS = 0.21
 
 
 # --------------------------------------------------------------------------------------
@@ -237,21 +246,34 @@ class Dhan:
             "Accept": "application/json",
         })
         self._last: dict[str, float] = {}
+        self._last_request: float | None = None
+        self._request_lock = threading.Lock()
 
     def _post(self, path: str, body: dict, min_gap: float = 0.25,
               timeout: float | tuple[float, float] = 30) -> dict:
-        wait = min_gap - (time.time() - self._last.get(path, 0.0))
-        if wait > 0:
-            time.sleep(wait)
         for attempt in range(4):
             try:
-                r = self.s.post(API + path, json=body, timeout=timeout)
+                with self._request_lock:
+                    now = time.monotonic()
+                    previous_path_request = self._last.get(path)
+                    wait = max(
+                        DHAN_DATA_MIN_REQUEST_GAP_SECONDS - (now - self._last_request)
+                        if self._last_request is not None else 0.0,
+                        min_gap - (now - previous_path_request)
+                        if previous_path_request is not None else 0.0,
+                        0.0,
+                    )
+                    if wait > 0:
+                        time.sleep(wait)
+                    started = time.monotonic()
+                    self._last_request = started
+                    self._last[path] = started
+                    r = self.s.post(API + path, json=body, timeout=timeout)
             except (requests.Timeout, requests.ConnectionError):
                 if attempt == 3:
                     raise
                 time.sleep(2 * (attempt + 1))
                 continue
-            self._last[path] = time.time()
             if r.status_code == 429:
                 time.sleep(2 + 2 * attempt)
                 continue
@@ -925,8 +947,8 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
 # One scan
 # --------------------------------------------------------------------------------------
 def scan(dh, master, prep, day, exclude, fired, universe=None, ignore_entry_cutoff=False,
-         live_orders_enabled=False):
-    now = dt.datetime.now(IST)
+         live_orders_enabled=False, now=None):
+    now = now or dt.datetime.now(IST)
     syms = [s for s in (universe or prep["stocks"]) if s in prep["stocks"] and s not in exclude]
     quotes = dh.ohlc({"NSE_EQ": [prep["stocks"][s]["sid"] for s in syms], "IDX_I": [NIFTY_ID]})
     eq = quotes.get("NSE_EQ") or {}
@@ -1306,7 +1328,11 @@ def renew_dhan_access_token(client_id, access_token):
         raise RuntimeError("Dhan token renewal returned invalid JSON") from exc
     if isinstance(result, dict):
         token_data = result.get("data") if isinstance(result.get("data"), dict) else result
-        new_token = token_data.get("accessToken") or token_data.get("access_token")
+        new_token = (
+            token_data.get("accessToken")
+            or token_data.get("access_token")
+            or token_data.get("token")
+        )
         if not isinstance(new_token, str):
             fields = ", ".join(sorted(str(key) for key in result))
             nested = result.get("data")

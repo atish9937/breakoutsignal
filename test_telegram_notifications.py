@@ -74,7 +74,11 @@ class TelegramNotificationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             response = Mock()
-            response.json.return_value = {"accessToken": "new-token", "expiryTime": "later"}
+            response.json.return_value = {
+                "token": "new-token",
+                "expiryTime": "later",
+                "createTime": "now",
+            }
             get.return_value = response
             with patch.object(scanner, "ENV_FILE", env_file):
                 with patch.dict(
@@ -92,6 +96,38 @@ class TelegramNotificationTests(unittest.TestCase):
                 f"{scanner.API}/RenewToken",
                 headers={"access-token": "old-token", "dhanClientId": "client"},
                 timeout=20,
+            )
+
+    @patch.object(scanner.requests, "get")
+    def test_renews_documented_access_token_field_and_persists_it(self, get):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_file = Path(temp_dir) / ".env"
+            env_file.write_text(
+                "DHAN_CLIENT_ID=client\nDHAN_ACCESS_TOKEN=old-token\n",
+                encoding="utf-8",
+            )
+            response = Mock()
+            response.json.return_value = {
+                "dhanClientId": "client",
+                "dhanClientName": "Test User",
+                "dhanClientUcc": "TEST",
+                "givenPowerOfAttorney": True,
+                "accessToken": "documented-new-token",
+                "expiryTime": "later",
+            }
+            get.return_value = response
+            with patch.object(scanner, "ENV_FILE", env_file):
+                with patch.dict(
+                    os.environ,
+                    {"DHAN_CLIENT_ID": "client", "DHAN_ACCESS_TOKEN": "old-token"},
+                    clear=True,
+                ):
+                    token = scanner.renew_dhan_access_token("client", "old-token")
+
+            self.assertEqual(token, "documented-new-token")
+            self.assertEqual(
+                dotenv_values(env_file)["DHAN_ACCESS_TOKEN"],
+                "documented-new-token",
             )
 
     @patch.object(scanner.requests, "get")

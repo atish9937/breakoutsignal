@@ -1,4 +1,5 @@
 import datetime as dt
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -112,11 +113,33 @@ class DhanRetryTests(unittest.TestCase):
             Mock(status_code=200, json=Mock(return_value={"data": {}})),
         ]
         client._last = {}
+        client._last_request = None
+        client._request_lock = threading.Lock()
         with patch.object(scanner.time, "sleep"):
             result = client.rolling_option({"strike": "ATM"})
         self.assertEqual(result, {"data": {}})
         self.assertEqual(client.s.post.call_count, 2)
         self.assertEqual(client.s.post.call_args.kwargs["timeout"], (10, 90))
+
+    def test_data_request_gap_is_shared_across_endpoints(self):
+        client = scanner.Dhan("client", "token")
+        response = Mock(status_code=200, json=Mock(return_value={}))
+        client.s.post = Mock(return_value=response)
+        current_time = [100.0]
+        waits = []
+
+        def fake_sleep(seconds):
+            waits.append(seconds)
+            current_time[0] += seconds
+
+        with patch.object(scanner.time, "monotonic", side_effect=lambda: current_time[0]):
+            with patch.object(scanner.time, "sleep", side_effect=fake_sleep):
+                client._post("/charts/intraday", {}, min_gap=0)
+                client._post("/marketfeed/ohlc", {}, min_gap=0)
+
+        self.assertEqual(len(waits), 1)
+        self.assertAlmostEqual(waits[0], scanner.DHAN_DATA_MIN_REQUEST_GAP_SECONDS)
+        self.assertEqual(client.s.post.call_count, 2)
 
 
 class BacktestMetricsTests(unittest.TestCase):
