@@ -103,10 +103,12 @@ RUN
     python breakout_scanner.py --universe nifty100      # which stocks to scan (default nifty50)
 
 UNIVERSE (pulled fresh every day, cached in scanner_out/)
-    nifty50 | niftynext50 | nifty100 | nifty200  - official NSE constituent lists (niftyindices.com)
+    nifty50, niftynext50, nifty100, nifty200, nifty500, niftymidcap50/100/150,
+    niftysmallcap50/100/250, niftybank - official NSE constituent lists
     fno        - every stock that has stock options on NSE (from the Dhan scrip master, ~200)
     watchlist  - the built-in WATCHLIST below
-    Combine with commas (nifty50,watchlist). Stocks without stock options are dropped automatically.
+    Combine with commas, e.g. nifty50,niftynext50,niftymidcap150,niftysmallcap250,niftybank.
+    Stocks without stock options are dropped automatically.
     Symbols are mapped to Dhan security ids from the Dhan scrip master.
     Each successful download is saved as scanner_out/index_<name>_<date>.json. If NSE can't be
     reached, the most recent saved list is used. The built-in WATCHLIST is used only if no list
@@ -425,11 +427,33 @@ def load_master(day: dt.date) -> tuple[pd.DataFrame | None, pd.DataFrame | None]
         return None, None
 
 
-INDEX_CSV = {  # official NSE constituent lists (niftyindices.com, with an NSE archive mirror)
+INDEX_CSV = {  # official NSE constituent lists (NSE archive, with Nifty Indices mirror)
     "nifty50": "ind_nifty50list.csv",
     "niftynext50": "ind_niftynext50list.csv",
     "nifty100": "ind_nifty100list.csv",
     "nifty200": "ind_nifty200list.csv",
+    "nifty500": "ind_nifty500list.csv",
+    "niftymidcap50": "ind_niftymidcap50list.csv",
+    "niftymidcap100": "ind_niftymidcap100list.csv",
+    "niftymidcap150": "ind_niftymidcap150list.csv",
+    "niftysmallcap50": "ind_niftysmallcap50list.csv",
+    "niftysmallcap100": "ind_niftysmallcap100list.csv",
+    "niftysmallcap250": "ind_niftysmallcap250list.csv",
+    "niftybank": "ind_niftybanklist.csv",
+}
+INDEX_MIN_SYMBOLS = {
+    "nifty50": 40,
+    "niftynext50": 40,
+    "nifty100": 80,
+    "nifty200": 160,
+    "nifty500": 400,
+    "niftymidcap50": 40,
+    "niftymidcap100": 80,
+    "niftymidcap150": 120,
+    "niftysmallcap50": 40,
+    "niftysmallcap100": 80,
+    "niftysmallcap250": 200,
+    "niftybank": 10,
 }
 
 
@@ -448,7 +472,7 @@ def fetch_index_symbols(name: str) -> list[str]:
             df = pd.read_csv(StringIO(r.text))
             col = next(c for c in df.columns if c.strip().lower() == "symbol")
             syms = df[col].astype(str).str.strip().str.upper().tolist()
-            if len(syms) >= 40:
+            if len(syms) >= INDEX_MIN_SYMBOLS[name]:
                 return syms
         except Exception as e:  # noqa: BLE001
             last_err = e
@@ -465,7 +489,7 @@ def _latest_saved_list(part: str) -> tuple[list[str], str] | None:
 
 
 def build_universe(spec: str, day: dt.date, eq: pd.DataFrame | None, opt: pd.DataFrame | None) -> dict:
-    """spec: comma list of nifty50 | niftynext50 | nifty100 | nifty200 | fno | watchlist.
+    """spec: comma list of supported NSE indices, fno, or watchlist.
     Returns {symbol: securityId}, keeping only stocks that have stock options (F&O).
 
     Where the list comes from (printed at start-up):
@@ -507,7 +531,8 @@ def build_universe(spec: str, day: dt.date, eq: pd.DataFrame | None, opt: pd.Dat
                         uni.update(WATCHLIST)
                         continue
         else:
-            sys.exit(f"Unknown universe '{part}'. Use nifty50, niftynext50, nifty100, nifty200, fno or watchlist.")
+            supported = ", ".join((*INDEX_CSV, "fno", "watchlist"))
+            sys.exit(f"Unknown universe '{part}'. Choose from {supported}.")
         no_id, no_fno = [], []
         for s in syms:
             sid = sid_of.get(s) or WATCHLIST.get(s)  # WATCHLIST only as an id backup if the scrip master failed
@@ -1359,7 +1384,7 @@ def renew_dhan_access_token(client_id, access_token):
         str(ENV_FILE),
         "DHAN_ACCESS_TOKEN",
         new_token,
-        quote_mode="always",
+        quote_mode="never",
     )
     if not success or key != "DHAN_ACCESS_TOKEN":
         raise RuntimeError("Could not persist the renewed token to .env")
@@ -1386,8 +1411,8 @@ def main():
                     help="extend entry cutoff to 15:25 IST and keep scheduled scans running until 15:30")
     ap.add_argument("--exclude", default="", help="comma-separated symbols to skip (results today, F&O ban)")
     ap.add_argument("--universe", default="nifty50",
-                    help="which stocks: nifty50 (default), niftynext50, nifty100, nifty200, fno (all F&O stocks), "
-                         "watchlist (built-in list); combine with commas, e.g. nifty50,watchlist")
+                    help="stocks from supported NSE indices (nifty50 default), fno (all F&O stocks), or watchlist; "
+                         "combine with commas, e.g. nifty50,niftymidcap150,niftybank")
     ap.add_argument("--enable-live-orders", action="store_true",
                     help="allow live Dhan orders only when ENABLE_LIVE_ORDERS=true in .env")
     ap.add_argument("--renew-token-only", action="store_true",

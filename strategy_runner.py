@@ -74,7 +74,8 @@ def main():
         help="extend breakout entries to 15:25 IST and keep breakout scans running until 15:30; trend-pullback keeps its normal cutoff",
     )
     parser.add_argument("--universe", default="nifty50",
-                        help="nifty50, niftynext50, nifty100, nifty200, fno, or watchlist")
+                        help="supported NSE indices, fno (all F&O stocks), or watchlist; "
+                             "combine with commas, e.g. nifty50,niftymidcap150,niftybank")
     parser.add_argument("--exclude", default="", help="comma-separated symbols to skip")
     args = parser.parse_args()
     exclude = {symbol.strip().upper() for symbol in args.exclude.split(",") if symbol.strip()}

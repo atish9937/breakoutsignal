@@ -91,6 +91,8 @@ class TelegramNotificationTests(unittest.TestCase):
 
             self.assertEqual(token, "new-token")
             self.assertEqual(dotenv_values(env_file)["DHAN_ACCESS_TOKEN"], "new-token")
+            self.assertIn("DHAN_ACCESS_TOKEN=new-token\n", env_file.read_text(encoding="utf-8"))
+            self.assertNotIn("DHAN_ACCESS_TOKEN='new-token'", env_file.read_text(encoding="utf-8"))
             self.assertEqual(dotenv_values(env_file)["TELEGRAM_CHAT_ID"], "@alerts")
             get.assert_called_once_with(
                 f"{scanner.API}/RenewToken",
@@ -128,6 +130,10 @@ class TelegramNotificationTests(unittest.TestCase):
             self.assertEqual(
                 dotenv_values(env_file)["DHAN_ACCESS_TOKEN"],
                 "documented-new-token",
+            )
+            self.assertIn(
+                "DHAN_ACCESS_TOKEN=documented-new-token\n",
+                env_file.read_text(encoding="utf-8"),
             )
 
     @patch.object(scanner.requests, "get")
