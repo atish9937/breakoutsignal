@@ -59,6 +59,14 @@ class StrategyRunnerTests(unittest.TestCase):
         self.assertEqual(strategy_runner.cycle_end(True), dt.time(15, 10))
         self.assertEqual(strategy_runner.cycle_end(False), dt.time(15, 10))
 
+    def test_report_deadline_uses_seconds_not_only_hour_and_minute(self):
+        before = dt.datetime(2026, 10, 19, 15, 9, 59, tzinfo=breakout.IST)
+        at_deadline = dt.datetime(2026, 10, 19, 15, 10, 0, tzinfo=breakout.IST)
+        after_deadline = dt.datetime(2026, 10, 19, 15, 10, 20, tzinfo=breakout.IST)
+        self.assertFalse(strategy_runner.report_due(before))
+        self.assertTrue(strategy_runner.report_due(at_deadline))
+        self.assertTrue(strategy_runner.report_due(after_deadline))
+
     def test_breakout_entry_cutoff_is_inclusive_for_the_1500_candle_cycle(self):
         client = Mock()
         now = dt.datetime(2026, 10, 19, 15, 0, 20, tzinfo=breakout.IST)

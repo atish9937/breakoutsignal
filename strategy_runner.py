@@ -29,6 +29,10 @@ def _at_or_before(now, cutoff):
     return now.strftime("%H:%M") <= cutoff.strftime("%H:%M")
 
 
+def report_due(now):
+    return now.time().replace(tzinfo=None) >= REPORT_TIME
+
+
 def load_fired_signals(path):
     fired = set()
     if path.exists():
@@ -218,7 +222,7 @@ def main():
 
     while True:
         now = dt.datetime.now(breakout.IST)
-        if not _at_or_before(now, end):
+        if report_due(now):
             try:
                 report_path = finish_report()
                 print(f"Daily performance report saved to {report_path}")
@@ -242,6 +246,8 @@ def main():
             )
         time.sleep(max(1, (next_run - dt.datetime.now(breakout.IST)).total_seconds()))
         cycle_time = dt.datetime.now(breakout.IST)
+        if report_due(cycle_time):
+            continue
         if not _at_or_before(cycle_time, end):
             continue
         try:
