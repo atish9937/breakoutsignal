@@ -76,15 +76,25 @@ UNIX / CRON
       CRON_TZ=Asia/Kolkata
       0 9 * * 1-5 /var/www/breakoutsignal/run_all_unix.sh >> /var/www/breakoutsignal/scanner_out/cron.log 2>&1
     This starts both strategies at 09:00 IST; they scan sequentially using one Dhan client
-    every five minutes from 09:20 through 12:35 IST (entry cutoff 12:30). Strategy
-    checks run one after another against the same candle-close time and shared API limiter.
+    every five minutes from 09:20 through 12:35 IST (entry cutoff 12:30). The combined runner
+    continues tracking saved BUY recommendations through 15:10 IST and sends the daily
+    HTML performance report to TELEGRAM_CHAT_ID. It saves the SQLite ledger and HTML report
+    under scanner_out/. Strategy checks run against the same candle-close time and shared
+    API limiter.
     CRON_TZ sets the schedule timezone on cron implementations that support it, so the server
     timezone does not need to be changed. The script uses flock to prevent overlapping runs.
     Create scanner_out before adding the cron entry so the log redirection can open its file.
-    To extend breakout entries to 15:25 IST while keeping trend-pullback at its normal
+    To extend breakout entries to 15:00 IST while keeping trend-pullback at its normal
     12:30 entry cutoff, add --ignore-entry-cutoff to the combined runner cron command.
-    The combined process then continues breakout scans until 15:30 IST; trend-pullback
-    stops after its normal 12:35 schedule.
+    The combined runner records both strategies' BUY recommendations in a local SQLite
+    ledger, checks subsequent completed 5-minute underlying candles, and sends a colored
+    HTML performance report to Telegram by 15:10 IST. The HTML file and ledger are saved
+    in scanner_out/. Use strategy_runner.py --report-only to retry a failed Telegram upload.
+    Breakout BUY recommendations stop at 15:00; report prices are the last completed
+    underlying 5-minute candle available at report time. Telegram or Dhan outages can
+    delay delivery; failures are logged and a Telegram upload can be retried with
+    strategy_runner.py --report-only. This is paper tracking, not actual fills or option
+    P&L; the runner does not place live orders.
     Dhan tokens expire after 24 hours. To keep the token active across weekends and scanner
     downtime, add this all-days maintenance schedule (keep AUTO_RENEW_DHAN_TOKEN=true):
       0 6,18 * * * /var/www/breakoutsignal/run_unix.sh --renew-token-only >> /var/www/breakoutsignal/scanner_out/token-renewal.log 2>&1
@@ -98,7 +108,8 @@ RUN
     python strategy_runner.py --once            # one cycle of both strategies
     python breakout_scanner.py                  # breakout strategy only, standalone
     python breakout_scanner.py --once           # one scan now (for testing)
-    python breakout_scanner.py --ignore-entry-cutoff  # extend entry cutoff to 15:25 IST; scan through market close
+    python strategy_runner.py --ignore-entry-cutoff  # breakout BUY cutoff 15:00; daily report by 15:10 IST
+    python strategy_runner.py --report-only          # retry/send today's saved HTML report
     python breakout_scanner.py --exclude TECHM,WIPRO   # skip stocks (results today / F&O ban)
     python breakout_scanner.py --universe nifty100      # which stocks to scan (default nifty50)
 
@@ -182,8 +193,8 @@ CONFIG = {
     "entry_cutoff": "12:30",
     "run_start": "09:20",
     "run_end": "12:35",
-    "extended_entry_cutoff": "15:25",
-    "extended_run_end": "15:30",
+    "extended_entry_cutoff": "15:00",
+    "extended_run_end": "15:05",
     "max_candidates_per_scan": 15,  # option-chain calls are slow (1 per 3 s)
 }
 
@@ -1408,7 +1419,7 @@ def main():
     ap = argparse.ArgumentParser(description="Intraday box-breakout scanner (Dhan API)")
     ap.add_argument("--once", action="store_true", help="run one scan now and exit")
     ap.add_argument("--ignore-entry-cutoff", action="store_true",
-                    help="extend entry cutoff to 15:25 IST and keep scheduled scans running until 15:30")
+                    help="extend entry cutoff to 15:00 IST and keep scheduled scans running until 15:05")
     ap.add_argument("--exclude", default="", help="comma-separated symbols to skip (results today, F&O ban)")
     ap.add_argument("--universe", default="nifty50",
                     help="stocks from supported NSE indices (nifty50 default), fno (all F&O stocks), or watchlist; "

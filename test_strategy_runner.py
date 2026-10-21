@@ -55,9 +55,42 @@ class StrategyRunnerTests(unittest.TestCase):
         self.assertTrue(scan_breakout.call_args.kwargs["ignore_entry_cutoff"])
         scan_pullback.assert_not_called()
 
-    def test_extended_cycle_end_uses_breakout_extended_run_end(self):
-        self.assertEqual(strategy_runner.cycle_end(True), dt.time(15, 30))
-        self.assertEqual(strategy_runner.cycle_end(False), dt.time(12, 35))
+    def test_both_schedules_keep_runner_alive_until_the_daily_report(self):
+        self.assertEqual(strategy_runner.cycle_end(True), dt.time(15, 10))
+        self.assertEqual(strategy_runner.cycle_end(False), dt.time(15, 10))
+
+    def test_breakout_entry_cutoff_is_inclusive_for_the_1500_candle_cycle(self):
+        client = Mock()
+        now = dt.datetime(2026, 10, 19, 15, 0, 20, tzinfo=breakout.IST)
+        fired = {"breakout": set(), "trend_pullback": set()}
+        with patch.object(breakout, "scan", return_value={}) as scan_breakout:
+            with patch.object(trend_pullback, "scan") as scan_pullback:
+                strategy_runner.run_cycle(
+                    client, object(), {}, {"AAA": 1}, set(), None,
+                    now.date(), now, fired, ignore_entry_cutoff=True,
+                )
+        scan_breakout.assert_called_once()
+        scan_pullback.assert_not_called()
+
+    def test_scans_stop_after_entry_window_but_tracker_keeps_updating(self):
+        client = Mock()
+        ledger = object()
+        now = dt.datetime(2026, 10, 19, 15, 5, 20, tzinfo=breakout.IST)
+        fired = {"breakout": set(), "trend_pullback": set()}
+        with patch.object(breakout, "scan") as scan_breakout:
+            with patch.object(trend_pullback, "scan") as scan_pullback:
+                with patch.object(
+                    strategy_runner.trade_performance, "update_open_trades"
+                ) as update:
+                    result = strategy_runner.run_cycle(
+                        client, object(), {}, {"AAA": 1}, set(), None,
+                        now.date(), now, fired, ignore_entry_cutoff=True,
+                        ledger=ledger,
+                    )
+        self.assertEqual(result, {})
+        scan_breakout.assert_not_called()
+        scan_pullback.assert_not_called()
+        update.assert_called_once()
 
     def test_strategy_error_is_reported_and_next_strategy_still_runs(self):
         client = Mock()
