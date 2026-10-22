@@ -141,6 +141,26 @@ class DhanRetryTests(unittest.TestCase):
         self.assertAlmostEqual(waits[0], scanner.DHAN_DATA_MIN_REQUEST_GAP_SECONDS)
         self.assertEqual(client.s.post.call_count, 2)
 
+    def test_option_chain_rate_limit_is_shared_with_expiry_list(self):
+        client = scanner.Dhan("client", "token")
+        response = Mock(status_code=200, json=Mock(return_value={"data": []}))
+        client.s.post = Mock(return_value=response)
+        current_time = [100.0]
+        waits = []
+
+        def fake_sleep(seconds):
+            waits.append(seconds)
+            current_time[0] += seconds
+
+        with patch.object(scanner.time, "monotonic", side_effect=lambda: current_time[0]):
+            with patch.object(scanner.time, "sleep", side_effect=fake_sleep):
+                client.expiries(123)
+                client.option_chain(123, "2026-10-29")
+
+        self.assertEqual(len(waits), 1)
+        self.assertAlmostEqual(waits[0], 3.1)
+        self.assertEqual(client.s.post.call_count, 2)
+
 
 class BacktestMetricsTests(unittest.TestCase):
     def test_metrics_include_total_r_and_drawdown(self):

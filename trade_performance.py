@@ -15,7 +15,7 @@ import pandas as pd
 import requests
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 ACTIVE_STATUSES = ("tracking", "t1_hit")
 WIN_STATUSES = ("t1_hit", "t2_hit", "t1_then_breakeven")
 RESOLVED_STATUSES = (*WIN_STATUSES, "stop_before_t1")
@@ -48,6 +48,16 @@ def connect(database: Path) -> sqlite3.Connection:
             target_1 REAL NOT NULL,
             target_2 REAL NOT NULL,
             last_price REAL,
+            option_security_id INTEGER,
+            option_expiry TEXT,
+            option_instrument TEXT NOT NULL DEFAULT 'OPTSTK',
+            option_segment TEXT NOT NULL DEFAULT 'NSE_FNO',
+            option_entry_ltp REAL,
+            option_entry_bid REAL,
+            option_entry_ask REAL,
+            option_lot_size INTEGER,
+            signal_json TEXT,
+            data_capture_error TEXT,
             status TEXT NOT NULL CHECK (
                 status IN ('tracking', 'stop_before_t1', 't1_hit', 't2_hit',
                            't1_then_breakeven', 'unresolved')
@@ -82,6 +92,43 @@ def connect(database: Path) -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS idx_paper_trade_events_trade_time
             ON paper_trade_events(trade_id, candle_time);
+        CREATE TABLE IF NOT EXISTS paper_instrument_candles (
+            id INTEGER PRIMARY KEY,
+            trade_id INTEGER NOT NULL REFERENCES paper_trades(id) ON DELETE CASCADE,
+            instrument_type TEXT NOT NULL CHECK (instrument_type IN ('underlying', 'option')),
+            exchange_segment TEXT NOT NULL,
+            security_id INTEGER NOT NULL,
+            interval_minutes INTEGER NOT NULL CHECK (interval_minutes = 1),
+            candle_time TEXT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL,
+            open_interest REAL,
+            fetched_at TEXT NOT NULL,
+            UNIQUE (trade_id, instrument_type, candle_time)
+        );
+        CREATE INDEX IF NOT EXISTS idx_paper_candles_trade_time
+            ON paper_instrument_candles(trade_id, instrument_type, candle_time);
+        CREATE TABLE IF NOT EXISTS paper_market_ticks (
+            instrument_segment TEXT NOT NULL,
+            security_id INTEGER NOT NULL,
+            session_date TEXT NOT NULL,
+            sampled_at TEXT NOT NULL,
+            last_price REAL,
+            last_trade_at TEXT,
+            best_bid REAL,
+            best_ask REAL,
+            bid_quantity INTEGER,
+            ask_quantity INTEGER,
+            volume INTEGER,
+            open_interest INTEGER,
+            source TEXT NOT NULL CHECK (source = 'dhan_websocket_full'),
+            PRIMARY KEY (instrument_segment, security_id, session_date, sampled_at)
+        );
+        CREATE INDEX IF NOT EXISTS idx_paper_ticks_instrument_time
+            ON paper_market_ticks(instrument_segment, security_id, sampled_at);
         CREATE TABLE IF NOT EXISTS performance_reports (
             session_date TEXT PRIMARY KEY,
             status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'failed')),
@@ -97,8 +144,39 @@ def connect(database: Path) -> sqlite3.Connection:
         row["name"]
         for row in connection.execute("PRAGMA table_info(paper_trades)").fetchall()
     }
+    tick_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(paper_market_ticks)").fetchall()
+    }
+    if "session_date" not in tick_columns:
+        connection.execute(
+            "ALTER TABLE paper_market_ticks ADD COLUMN session_date TEXT NOT NULL DEFAULT ''"
+        )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_paper_ticks_session_instrument_time
+        ON paper_market_ticks(session_date, instrument_segment, security_id, sampled_at)
+        """
+    )
     if "last_price" not in columns:
         connection.execute("ALTER TABLE paper_trades ADD COLUMN last_price REAL")
+    new_columns = {
+        "option_security_id": "INTEGER",
+        "option_expiry": "TEXT",
+        "option_instrument": "TEXT NOT NULL DEFAULT 'OPTSTK'",
+        "option_segment": "TEXT NOT NULL DEFAULT 'NSE_FNO'",
+        "option_entry_ltp": "REAL",
+        "option_entry_bid": "REAL",
+        "option_entry_ask": "REAL",
+        "option_lot_size": "INTEGER",
+        "signal_json": "TEXT",
+        "data_capture_error": "TEXT",
+    }
+    for column, definition in new_columns.items():
+        if column not in columns:
+            connection.execute(
+                f"ALTER TABLE paper_trades ADD COLUMN {column} {definition}"
+            )
     now = dt.datetime.now(dt.timezone.utc).isoformat()
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)",
@@ -183,9 +261,10 @@ def record_buy_recommendations(
             """
             INSERT OR IGNORE INTO paper_trades (
                 strategy, session_date, symbol, side, security_id, signal_time,
-                reference_entry, stop_price, target_1, target_2, status,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tracking', ?, ?)
+                    reference_entry, stop_price, target_1, target_2, option_security_id,
+                    option_expiry, option_entry_ltp, option_entry_bid, option_entry_ask,
+                    option_lot_size, signal_json, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tracking', ?, ?)
             """,
             (
                 strategy,
@@ -198,6 +277,17 @@ def record_buy_recommendations(
                 stop,
                 target_1,
                 target_2,
+                (result.get("option") or {}).get("security_id"),
+                (result.get("option") or {}).get("expiry"),
+                _as_number((result.get("option") or {}).get("premium")),
+                _as_number((result.get("option") or {}).get("bid")),
+                _as_number((result.get("option") or {}).get("ask")),
+                (result.get("option") or {}).get("lot_size"),
+                json.dumps(
+                    {"strategy": strategy, "scan_time": scan_time, "result": result},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
                 now,
                 now,
             ),
@@ -259,14 +349,23 @@ def import_saved_signals(
                 """
                 INSERT OR IGNORE INTO paper_trades (
                     strategy, session_date, symbol, side, security_id, signal_time,
-                    reference_entry, stop_price, target_1, target_2, status,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tracking', ?, ?)
+                    reference_entry, stop_price, target_1, target_2, option_security_id,
+                    option_expiry, option_entry_ltp, option_entry_bid, option_entry_ask,
+                    option_lot_size, signal_json, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tracking', ?, ?)
                 """,
                 (
                     strategy, session_date.isoformat(), symbol, side, int(security_id),
                     _timestamp(session_date, signal_time).isoformat(),
-                    entry, stop, target_1, target_2, now, now,
+                    entry, stop, target_1, target_2,
+                    (signal.get("option") or {}).get("security_id"),
+                    (signal.get("option") or {}).get("expiry"),
+                    _as_number((signal.get("option") or {}).get("premium")),
+                    _as_number((signal.get("option") or {}).get("bid")),
+                    _as_number((signal.get("option") or {}).get("ask")),
+                    (signal.get("option") or {}).get("lot_size"),
+                    json.dumps(signal, ensure_ascii=False, separators=(",", ":")),
+                    now, now,
                 ),
             )
             inserted += cursor.rowcount
@@ -313,7 +412,7 @@ def update_open_trades(
     session_date: dt.date,
     now: dt.datetime,
 ) -> int:
-    """Fetch completed 5-minute candles and persist outcomes idempotently."""
+    """Fetch completed post-signal 1-minute candles and persist outcomes idempotently."""
     placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
     trades = connection.execute(
         f"""
@@ -330,7 +429,7 @@ def update_open_trades(
     for trade in trades:
         grouped.setdefault((trade["symbol"], trade["security_id"]), []).append(trade)
 
-    complete_through = pd.Timestamp(now) - dt.timedelta(minutes=5)
+    complete_through = pd.Timestamp(now).floor("min") - dt.timedelta(minutes=1)
     processed = 0
     for (symbol, security_id), symbol_trades in grouped.items():
         try:
@@ -338,6 +437,7 @@ def update_open_trades(
                 security_id,
                 dt.datetime.combine(session_date, dt.time(9, 15), now.tzinfo),
                 now,
+                interval=1,
             )
         except Exception as exc:  # noqa: BLE001
             message = f"{type(exc).__name__}: {exc}"
@@ -371,7 +471,7 @@ def update_open_trades(
 
         for trade in symbol_trades:
             signal_time = pd.Timestamp(trade["signal_time"]).tz_convert(now.tzinfo)
-            first_following_bar = signal_time.floor("5min")
+            first_following_bar = signal_time.ceil("min")
             last_candle = (
                 pd.Timestamp(trade["last_candle_at"]).tz_convert(now.tzinfo)
                 if trade["last_candle_at"] else None
@@ -389,6 +489,21 @@ def update_open_trades(
                 status, event = _process_candle(current_trade, candle)
                 candle_iso = candle_time.isoformat()
                 recorded_at = dt.datetime.now(dt.timezone.utc).isoformat()
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO paper_instrument_candles (
+                        trade_id, instrument_type, exchange_segment, security_id,
+                        interval_minutes, candle_time, open, high, low, close,
+                        volume, open_interest, fetched_at
+                    ) VALUES (?, 'underlying', 'NSE_EQ', ?, 1, ?, ?, ?, ?, ?, ?, NULL, ?)
+                    """,
+                    (
+                        trade["id"], security_id, candle_iso,
+                        float(candle["open"]), float(candle["high"]),
+                        float(candle["low"]), float(candle["close"]),
+                        float(candle.get("volume", 0)), recorded_at,
+                    ),
+                )
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO paper_trade_events (
@@ -426,12 +541,143 @@ def update_open_trades(
     return processed
 
 
+def archive_one_minute_candles(
+    connection: sqlite3.Connection,
+    dhan,
+    session_date: dt.date,
+    now: dt.datetime,
+) -> int:
+    """Archive post-signal 1-minute underlying and option candles from Dhan."""
+    trades = connection.execute(
+        "SELECT * FROM paper_trades WHERE session_date = ? ORDER BY id",
+        (session_date.isoformat(),),
+    ).fetchall()
+    if not trades:
+        return 0
+    connection.execute(
+        """
+        UPDATE paper_trades
+        SET data_capture_error = CASE
+            WHEN option_security_id IS NULL
+            THEN 'Dhan option security ID unavailable; option candles cannot be archived'
+            ELSE NULL
+        END
+        WHERE session_date = ?
+        """,
+        (session_date.isoformat(),),
+    )
+    connection.commit()
+
+    start = dt.datetime.combine(session_date, dt.time(9, 15), now.tzinfo)
+    complete_through = pd.Timestamp(now).floor("min") - dt.timedelta(minutes=1)
+    instruments: dict[tuple[str, int, str], list[sqlite3.Row]] = {}
+    for trade in trades:
+        instruments.setdefault(
+            ("NSE_EQ", int(trade["security_id"]), "EQUITY"), []
+        ).append(trade)
+        if trade["option_security_id"]:
+            instruments.setdefault(
+                (
+                    trade["option_segment"] or "NSE_FNO",
+                    int(trade["option_security_id"]),
+                    trade["option_instrument"] or "OPTSTK",
+                ),
+                [],
+            ).append(trade)
+
+    saved = 0
+    for (segment, security_id, instrument), instrument_trades in instruments.items():
+        try:
+            candles = dhan.intraday(
+                security_id,
+                start,
+                now,
+                seg=segment,
+                inst=instrument,
+                interval=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            error = f"{segment}/{security_id}: {type(exc).__name__}: {exc}"
+            connection.executemany(
+                "UPDATE paper_trades SET data_capture_error = ?, updated_at = ? WHERE id = ?",
+                [
+                    (error, dt.datetime.now(dt.timezone.utc).isoformat(), row["id"])
+                    for row in instrument_trades
+                ],
+            )
+            connection.commit()
+            print(f"One-minute candle archive failed for {error}", file=sys.stderr)
+            continue
+
+        if candles.empty:
+            error = f"{segment}/{security_id}: Dhan returned no one-minute candles"
+            connection.executemany(
+                "UPDATE paper_trades SET data_capture_error = ?, updated_at = ? WHERE id = ?",
+                [
+                    (error, dt.datetime.now(dt.timezone.utc).isoformat(), row["id"])
+                    for row in instrument_trades
+                ],
+            )
+            connection.commit()
+            print(error, file=sys.stderr)
+            continue
+        if candles.index.tz is None:
+            candles.index = candles.index.tz_localize(now.tzinfo)
+        else:
+            candles.index = candles.index.tz_convert(now.tzinfo)
+
+        instrument_type = "option" if segment == "NSE_FNO" else "underlying"
+        for trade in instrument_trades:
+            signal_time = pd.Timestamp(trade["signal_time"]).tz_convert(now.tzinfo)
+            first_complete_bar = signal_time.ceil("min")
+            rows = candles.loc[
+                (candles.index >= first_complete_bar)
+                & (candles.index <= complete_through)
+            ]
+            for candle_time, candle in rows.iterrows():
+                fetched_at = dt.datetime.now(dt.timezone.utc).isoformat()
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO paper_instrument_candles (
+                        trade_id, instrument_type, exchange_segment, security_id,
+                        interval_minutes, candle_time, open, high, low, close,
+                        volume, open_interest, fetched_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trade["id"], instrument_type, segment, security_id,
+                        candle_time.isoformat(), float(candle["open"]),
+                        float(candle["high"]), float(candle["low"]),
+                        float(candle["close"]),
+                        float(candle.get("volume", 0)),
+                        (
+                            float(candle["open_interest"])
+                            if "open_interest" in candle and pd.notna(candle["open_interest"])
+                            else None
+                        ),
+                        fetched_at,
+                    ),
+                )
+                saved += 1
+        connection.commit()
+    return saved
+
+
 def _report_rows(connection: sqlite3.Connection, session_date: dt.date) -> list[sqlite3.Row]:
     return connection.execute(
         """
-        SELECT * FROM paper_trades
-        WHERE session_date = ?
-        ORDER BY CASE strategy WHEN 'breakout' THEN 0 ELSE 1 END, symbol, side
+        SELECT t.*,
+            (SELECT COUNT(*) FROM paper_market_ticks q
+             WHERE q.instrument_segment = t.option_segment
+               AND q.security_id = t.option_security_id
+               AND q.session_date = t.session_date) AS option_quote_samples,
+            (SELECT COUNT(*) FROM paper_market_ticks q
+             WHERE q.instrument_segment = 'NSE_EQ'
+               AND q.security_id = t.security_id
+               AND q.session_date = t.session_date) AS underlying_quote_samples
+        FROM paper_trades t
+        WHERE t.session_date = ?
+        ORDER BY CASE t.strategy WHEN 'breakout' THEN 0 ELSE 1 END, t.symbol, t.side
         """,
         (session_date.isoformat(),),
     ).fetchall()
@@ -470,11 +716,23 @@ def render_html(rows: list[sqlite3.Row], session_date: dt.date, generated_at: dt
     body_rows = []
     for row in rows:
         last_price = f"{row['last_price']:.2f}" if row["last_price"] is not None else "N/A"
+        option_contract = (
+            f"{row['symbol']} {row['option_expiry'] or ''} "
+            f"{row['side']} #{row['option_security_id']}"
+            if row["option_security_id"] else "Unavailable"
+        )
+        entry_quote = (
+            f"{row['option_entry_bid'] or 0:.2f} / {row['option_entry_ask'] or 0:.2f}"
+            if row["option_entry_bid"] is not None or row["option_entry_ask"] is not None
+            else "Unavailable"
+        )
         body_rows.append(
             "<tr>"
             f"<td>{html.escape(row['strategy'].replace('_', ' ').title())}</td>"
             f"<td>{html.escape(row['symbol'])}</td>"
             f"<td>{html.escape(row['side'])}</td>"
+            f"<td>{html.escape(option_contract)}</td>"
+            f"<td>{entry_quote}</td>"
             f"<td>{row['reference_entry']:.2f}</td>"
             f"<td>{row['stop_price']:.2f}</td>"
             f"<td>{row['target_1']:.2f}</td>"
@@ -485,6 +743,9 @@ def render_html(rows: list[sqlite3.Row], session_date: dt.date, generated_at: dt
             f"<td>{'Yes' if row['target_1_at'] else 'No'}</td>"
             f"<td>{'Yes' if row['target_2_at'] else 'No'}</td>"
             f"<td>{html.escape(row['tracking_error'] or '')}</td>"
+            f"<td>{row['option_quote_samples']}</td>"
+            f"<td>{row['underlying_quote_samples']}</td>"
+            f"<td>{html.escape(row['data_capture_error'] or '')}</td>"
             "</tr>"
         )
     sections = []
@@ -507,9 +768,12 @@ def render_html(rows: list[sqlite3.Row], session_date: dt.date, generated_at: dt
         "<p>No BUY recommendations were recorded today.</p>"
         if not rows else
         "<div class='table-wrap'><table><thead><tr>"
-        "<th>Strategy</th><th>Symbol</th><th>Side</th><th>Reference</th>"
+        "<th>Strategy</th><th>Symbol</th><th>Side</th><th>Option contract</th>"
+        "<th>Signal option bid/ask</th><th>Reference</th>"
         "<th>Stop</th><th>T1</th><th>T2</th><th>Last price</th><th>Price candle (IST)</th><th>Outcome</th>"
         "<th>T1 hit</th><th>T2 hit</th><th>Tracking notes</th>"
+        "<th>Option live quote samples</th><th>Underlying live quote samples</th>"
+        "<th>Data capture notes</th>"
         f"</tr></thead><tbody>{''.join(body_rows)}</tbody></table></div>"
     )
     return f"""<!doctype html>
@@ -538,7 +802,7 @@ th{{background:#eaf0f7;color:#263b58;}} .status{{font-weight:700;}}
 <p>Generated: {generated_at.astimezone(dt.timezone(dt.timedelta(hours=5, minutes=30))).strftime('%H:%M:%S')} IST</p>
 <p>Recommendations only — no orders were placed.</p></header>
 {''.join(sections)}<h2>Recommendation outcomes</h2>{table}
-<p class="note">Win rate counts T1 reached before the stop among resolved recommendations; unresolved items are excluded from the denominator. T2 is reported separately. If one 5-minute candle crosses both a stop and target, the stop is counted first. After T1, the reference entry is treated as a breakeven stop. Outcomes use underlying candles and are not actual fills or option P&amp;L. The report reflects completed candles available by the report cutoff; tracking errors are shown per recommendation.</p>
+<p class="note">Underlying outcomes use completed 1-minute candles after the signal; a candle starting before a signal is excluded. If one candle crosses both a stop and target, the stop is counted first. This is still not an actual fill or an option P&amp;L simulation. Dhan's live full-feed samples store option/underlying LTP and best bid/ask during the runner session. Live quote samples can be missing before deployment, during feed outages, or for contracts that Dhan does not return. Historical one-minute candles are archived in the local database after the Telegram report; they contain OHLC, not historical bid/ask or proof of order fill. Capture errors are shown per trade.</p>
 </main></body></html>"""
 
 

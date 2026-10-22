@@ -242,6 +242,9 @@ class TelegramNotificationTests(unittest.TestCase):
         args, kwargs = post.call_args
         self.assertEqual(args[0], "https://api.telegram.org/botbot-secret/sendMessage")
         self.assertEqual(kwargs["json"]["chat_id"], "123")
+        self.assertTrue(
+            kwargs["json"]["text"].startswith("[BREAKOUT INTRADAY OPTIONS SIGNAL]")
+        )
         self.assertIn("BUY_CE TEST", kwargs["json"]["text"])
         self.assertEqual(kwargs["timeout"], 10)
         response.raise_for_status.assert_called_once()
@@ -272,47 +275,6 @@ class TelegramNotificationTests(unittest.TestCase):
         self.assertIn("chat not found", "".join(
             str(call.args[0]) for call in stderr.write.call_args_list
         ))
-
-    @patch.object(scanner.requests, "post")
-    def test_sends_completion_message_when_scan_has_no_buy_signals(self, post):
-        response = Mock()
-        response.json.return_value = {"ok": True}
-        post.return_value = response
-
-        scanner.notify_scan_completion({
-            "scan_time": "2026-10-19 10:00:00",
-            "candidates_checked": 2,
-            "results": [
-                {"verdict": "WATCH_CE", "symbol": "AAA"},
-                {"verdict": "SKIP_PE", "symbol": "BBB"},
-            ],
-            "nifty": {"ltp": 25000, "chg_pct": 0.5, "bias": "BULLISH"},
-        })
-
-        post.assert_called_once()
-        message = post.call_args.kwargs["json"]["text"]
-        self.assertIn("Scan complete - 2026-10-19 10:00:00 IST", message)
-        self.assertIn("Candidates: 2", message)
-        self.assertIn("BUY: 0 | WATCH: 1 | SKIP: 1", message)
-        self.assertIn("No BUY signals this scan.", message)
-
-    @patch.object(scanner.requests, "post")
-    def test_completion_message_lists_buy_signals(self, post):
-        response = Mock()
-        response.json.return_value = {"ok": True}
-        post.return_value = response
-
-        scanner.notify_scan_completion({
-            "scan_time": "2026-10-19 10:05:00",
-            "candidates_checked": 1,
-            "results": [{"verdict": "BUY_PE", "symbol": "AAA", "ltp": 123.4}],
-            "nifty": {"ltp": 25000, "chg_pct": -0.2, "bias": "BEARISH"},
-        })
-
-        message = post.call_args.kwargs["json"]["text"]
-        self.assertIn("BUY: 1 | WATCH: 0 | SKIP: 0", message)
-        self.assertIn("BUY_PE AAA @ 123.4", message)
-
 
 if __name__ == "__main__":
     unittest.main()

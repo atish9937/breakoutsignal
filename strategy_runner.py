@@ -12,13 +12,17 @@ import traceback
 import requests
 
 import breakout_scanner as breakout
+import intraday_multiframe_strategy
 import trend_pullback
 import trade_performance
+import swing_option_strategy
+from paper_quote_feed import DhanQuoteRecorder
 
 
 STRATEGY_START = dt.time(9, 20)
 STRATEGY_END = dt.time(12, 35)
 REPORT_TIME = dt.time(15, 10)
+SWING_REPORT_TIME = dt.time(15, 35)
 
 
 def cycle_end(ignore_entry_cutoff):
@@ -99,7 +103,79 @@ def run_cycle(dh, master, prep, universe, exclude, trend_expiry, day, now, fired
                 file=sys.stderr,
             )
             traceback.print_exc()
+    try:
+        signals = intraday_multiframe_strategy.scan(
+            dh,
+            master,
+            prep,
+            universe,
+            day,
+            now,
+            fired.setdefault("daily_hourly_15m", set()),
+        )
+        if signals:
+            results["daily_hourly_15m"] = signals
+    except breakout.DhanAuthError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"{intraday_multiframe_strategy.STRATEGY} scan failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        traceback.print_exc()
+    try:
+        exited = intraday_multiframe_strategy.monitor_positions(
+            dh, day, now
+        )
+        if exited:
+            print(f"Sent {len(exited)} same-day 15m paper exit notification(s).")
+    except breakout.DhanAuthError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"{intraday_multiframe_strategy.STRATEGY} exit monitor failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        traceback.print_exc()
     return results
+
+
+def run_swing_next_session_checks(dh, master, day, now):
+    try:
+        signals = swing_option_strategy.monitor_next_session(
+            dh, master, day, now, breakout.OUT
+        )
+        if signals:
+            print(f"Confirmed {len(signals)} next-session swing paper signal(s).")
+    except breakout.DhanAuthError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"Next-session swing check failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        traceback.print_exc()
+
+
+def run_swing_candidate_report(dh, master, universe, day):
+    try:
+        report = swing_option_strategy.scan_daily_candidates(
+            dh, master, universe, day, breakout.OUT
+        )
+        swing_option_strategy.send_daily_report(report)
+        print(
+            f"Saved {report['candidate_count']} daily swing setup candidate(s) "
+            f"to {report['output_path']}; option chains checked: "
+            f"{report['checked_option_chains']}."
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"Daily swing paper-candidate scan failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        traceback.print_exc()
 
 
 def main():
@@ -190,6 +266,9 @@ def main():
         "trend_pullback": load_fired_signals(
             breakout.OUT / f"trend_pullback_signals_{day}.jsonl"
         ),
+        "daily_hourly_15m": load_fired_signals(
+            breakout.OUT / f"daily_hourly_15m_signals_{day}.jsonl"
+        ),
     }
 
     if args.once:
@@ -209,9 +288,10 @@ def main():
               f"{end.strftime('%H:%M')} IST report. No live orders are placed. Ctrl+C to stop.")
 
     def finish_report():
+        quote_recorder.stop()
         report_now = dt.datetime.now(breakout.IST)
         trade_performance.update_open_trades(ledger, dh, day, report_now)
-        return trade_performance.finalize_day(
+        report_path = trade_performance.finalize_day(
             ledger,
             day,
             breakout.OUT,
@@ -219,7 +299,71 @@ def main():
             os.getenv("TELEGRAM_CHAT_ID"),
             report_now,
         )
+        try:
+            archived = trade_performance.archive_one_minute_candles(
+                ledger, dh, day, dt.datetime.now(breakout.IST)
+            )
+            print(
+                f"Archived {archived} post-signal one-minute instrument candles "
+                "after report delivery."
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"Post-report one-minute candle archive failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            traceback.print_exc()
+        swing_scan_time = dt.datetime.combine(
+            day, SWING_REPORT_TIME, breakout.IST
+        )
+        if dt.datetime.now(breakout.IST) < swing_scan_time:
+            print(
+                "Waiting until 15:35 IST so the daily market candles are complete "
+                "before generating swing candidates."
+            )
+            while True:
+                current = dt.datetime.now(breakout.IST)
+                wait_seconds = (swing_scan_time - current).total_seconds()
+                if wait_seconds <= 0:
+                    break
+                next_run = (
+                    current.replace(second=0, microsecond=0)
+                    + dt.timedelta(minutes=5 - current.minute % 5)
+                    + dt.timedelta(seconds=20)
+                )
+                time.sleep(
+                    min(wait_seconds, max(1, (next_run - current).total_seconds()))
+                )
+                current = dt.datetime.now(breakout.IST)
+                try:
+                    exited = intraday_multiframe_strategy.monitor_positions(
+                        dh, day, current
+                    )
+                    if exited:
+                        print(
+                            f"Sent {len(exited)} same-day 15m "
+                            "paper exit notification(s)."
+                        )
+                except breakout.DhanAuthError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"Post-report same-day exit monitor failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                    traceback.print_exc()
+        run_swing_candidate_report(dh, master, universe, day)
+        return report_path
 
+    quote_recorder = DhanQuoteRecorder(
+        breakout.OUT / "paper_trade_ledger.sqlite3",
+        client_id,
+        access_token,
+        day,
+    )
+    quote_recorder.start()
     while True:
         now = dt.datetime.now(breakout.IST)
         if report_due(now):
@@ -253,12 +397,16 @@ def main():
         try:
             run_cycle(dh, master, prep, universe, exclude, prep.get("expiry"),
                       day, cycle_time, fired, args.ignore_entry_cutoff, ledger)
+            run_swing_next_session_checks(
+                dh, master, day, cycle_time
+            )
         except breakout.DhanAuthError as exc:
             sys.exit(f"Dhan rejected the token ({exc}). Check Dhan credentials and retry.")
         except requests.RequestException as exc:
             print(f"Shared Dhan request failed; strategies will retry next cycle: {exc}",
                   file=sys.stderr)
         except KeyboardInterrupt:
+            quote_recorder.stop()
             print("\nStopped.")
             return
 

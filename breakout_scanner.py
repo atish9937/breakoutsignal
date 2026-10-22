@@ -87,14 +87,23 @@ UNIX / CRON
     To extend breakout entries to 15:00 IST while keeping trend-pullback at its normal
     12:30 entry cutoff, add --ignore-entry-cutoff to the combined runner cron command.
     The combined runner records both strategies' BUY recommendations in a local SQLite
-    ledger, checks subsequent completed 5-minute underlying candles, and sends a colored
-    HTML performance report to Telegram by 15:10 IST. The HTML file and ledger are saved
-    in scanner_out/. Use strategy_runner.py --report-only to retry a failed Telegram upload.
-    Breakout BUY recommendations stop at 15:00; report prices are the last completed
-    underlying 5-minute candle available at report time. Telegram or Dhan outages can
-    delay delivery; failures are logged and a Telegram upload can be retried with
-    strategy_runner.py --report-only. This is paper tracking, not actual fills or option
-    P&L; the runner does not place live orders.
+    ledger, checks subsequent completed 1-minute underlying candles, and sends a colored
+    HTML performance report to Telegram by 15:10 IST. During the session, a Dhan WebSocket
+    recorder stores sampled option/underlying LTP and best bid/ask; after report delivery,
+    Dhan's historical chart API archives post-signal 1-minute OHLC for the option and
+    underlying. The HTML file and ledger are saved in scanner_out/. Install requirements.txt
+    so the WebSocket recorder is available. Use strategy_runner.py --report-only to retry
+    a failed Telegram upload. Breakout BUY recommendations stop at 15:00. WebSocket data
+    starts only once this version is deployed and running; historical OHLC does not provide
+    historical bid/ask or prove order fills. This is paper tracking, not actual fills or
+    option P&L; the runner does not place live orders. After the intraday report, it also
+    saves a separate swing-option candidate JSON and sends a paper-only Telegram summary
+    after 15:35 IST, allowing the daily market candles to complete.
+    Swing candidates use daily trend-pullback or 20-session-breakout checks, require an
+    option expiry at least 7 calendar days away, compare ATM and slightly ITM quotes, and
+    expire if the underlying trigger is not confirmed on the next trading session. They
+    are not live signals. Compare exit rules with swing_option_backtest.py before relying
+    on them; historical option candles lack bid/ask spreads and verified fills.
     Dhan tokens expire after 24 hours. To keep the token active across weekends and scanner
     downtime, add this all-days maintenance schedule (keep AUTO_RENEW_DHAN_TOKEN=true):
       0 6,18 * * * /var/www/breakoutsignal/run_unix.sh --renew-token-only >> /var/www/breakoutsignal/scanner_out/token-renewal.log 2>&1
@@ -272,7 +281,12 @@ class Dhan:
             try:
                 with self._request_lock:
                     now = time.monotonic()
-                    previous_path_request = self._last.get(path)
+                    rate_limit_key = (
+                        "/optionchain"
+                        if path in ("/optionchain", "/optionchain/expirylist")
+                        else path
+                    )
+                    previous_path_request = self._last.get(rate_limit_key)
                     wait = max(
                         DHAN_DATA_MIN_REQUEST_GAP_SECONDS - (now - self._last_request)
                         if self._last_request is not None else 0.0,
@@ -284,7 +298,7 @@ class Dhan:
                         time.sleep(wait)
                     started = time.monotonic()
                     self._last_request = started
-                    self._last[path] = started
+                    self._last[rate_limit_key] = started
                     r = self.s.post(API + path, json=body, timeout=timeout)
             except (requests.Timeout, requests.ConnectionError):
                 if attempt == 3:
@@ -586,7 +600,12 @@ def lot_and_id(master, sym, expiry, strike, opt_type):
 def prepare(dh: Dhan, day: dt.date, symbols: dict) -> dict:
     path = OUT / f"prep_{day}.json"
     old = json.loads(path.read_text()) if path.exists() else {"stocks": {}, "expiry": None}
-    todo = {s: i for s, i in symbols.items() if s not in old["stocks"]}
+    todo = {
+        s: i for s, i in symbols.items()
+        if s not in old["stocks"]
+        or "ema20" not in old["stocks"][s]
+        or "ema50" not in old["stocks"][s]
+    }
     if not todo and old.get("expiry"):
         return old
     print(f"Preparing daily levels for {len(todo)} stocks (about {max(1, len(todo) // 40)} min)...")
@@ -625,6 +644,8 @@ def prepare(dh: Dhan, day: dt.date, symbols: dict) -> dict:
                 "prev_close": float(d["close"].iloc[-1]),
                 "sma20": round(float(d["close"].tail(20).mean()), 2),
                 "sma50": round(float(d["close"].tail(50).mean()), 2) if len(d) >= 50 else None,
+                "ema20": round(float(ema(d["close"], 20).iloc[-1]), 2),
+                "ema50": round(float(ema(d["close"], 50).iloc[-1]), 2),
                 "chg_3m_pct": round((d["close"].iloc[-1] / d["close"].iloc[max(0, len(d) - 63)] - 1) * 100, 2),
                 "avg_vol20": round(float(d["volume"].tail(20).mean()), 0),
                 "slot_avg_vol": slot_avg, "cum_avg_vol": cum_avg, "warm_closes": warm,
@@ -1074,7 +1095,6 @@ def scan(dh, master, prep, day, exclude, fired, universe=None, ignore_entry_cuto
         print("\n=========== AI VALIDATION BATCH (all new recommendations this scan, copy from here) ===========")
         print(json.dumps(batch, indent=2))
         print("=========== END AI VALIDATION BATCH ===========\n")
-    notify_scan_completion(snapshot)
     return snapshot
 
 
@@ -1126,7 +1146,8 @@ def notify(r, order_state=None):
     if not (tok and chat):
         return
     o, p = r.get("option", {}), r.get("plan", {})
-    text = (f"{r['verdict']} {r['symbol']} @ {r['ltp']} (trigger {r['trigger_level']}) - "
+    text = (f"[BREAKOUT INTRADAY OPTIONS SIGNAL]\n"
+            f"{r['verdict']} {r['symbol']} @ {r['ltp']} (trigger {r['trigger_level']}) - "
             f"validate catalyst/news before acting\n"
             f"{o.get('contract')} ~Rs{o.get('premium')} lot {o.get('lot_size')}\n"
             f"Stop {p.get('stop')} / prem {o.get('premium_stop')} | T1 {p.get('t1')} / {o.get('premium_t1')} | "
@@ -1139,38 +1160,6 @@ def notify(r, order_state=None):
         if order_state.get("reason"):
             text += f" - {order_state['reason']}"
     send_telegram_message(tok, chat, text)
-
-
-def notify_scan_completion(snapshot):
-    """Send a concise Telegram summary after each successfully completed scan."""
-    load_env()
-    tok, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    if not (tok and chat):
-        return
-
-    results = snapshot["results"]
-    counts = {
-        verdict: sum(result["verdict"].startswith(verdict) for result in results)
-        for verdict in ("BUY", "WATCH", "SKIP")
-    }
-    lines = [
-        f"Scan complete - {snapshot['scan_time']} IST",
-        f"Candidates: {snapshot['candidates_checked']}",
-        f"BUY: {counts['BUY']} | WATCH: {counts['WATCH']} | SKIP: {counts['SKIP']}",
-    ]
-    buys = [result for result in results if result["verdict"].startswith("BUY")]
-    if buys:
-        lines.append("BUY signals:")
-        lines.extend(
-            f"{result['verdict']} {result['symbol']} @ {result.get('ltp')}"
-            for result in buys
-        )
-    else:
-        lines.append("No BUY signals this scan.")
-
-    nifty = snapshot.get("nifty") or {}
-    lines.append(f"Nifty: {nifty.get('ltp')} ({nifty.get('chg_pct')}%), bias {nifty.get('bias')}")
-    send_telegram_message(tok, chat, "\n".join(lines))
 
 
 def send_telegram_message(token, chat_id, text):

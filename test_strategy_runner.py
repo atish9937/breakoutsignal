@@ -8,6 +8,34 @@ import trend_pullback
 
 
 class StrategyRunnerTests(unittest.TestCase):
+    def test_daily_swing_report_runs_as_a_paper_only_post_market_scan(self):
+        client = Mock()
+        master = object()
+        universe = {"AAA": 1}
+        day = dt.date(2026, 10, 19)
+        report = {
+            "candidate_count": 0,
+            "checked_option_chains": 0,
+            "output_path": "swing-candidates.json",
+        }
+
+        with patch.object(
+            strategy_runner.swing_option_strategy,
+            "scan_daily_candidates",
+            return_value=report,
+        ) as scan:
+            with patch.object(
+                strategy_runner.swing_option_strategy, "send_daily_report"
+            ) as send:
+                strategy_runner.run_swing_candidate_report(
+                    client, master, universe, day
+                )
+
+        scan.assert_called_once_with(
+            client, master, universe, day, breakout.OUT
+        )
+        send.assert_called_once_with(report)
+
     def test_all_strategies_run_with_same_client_and_cycle_time(self):
         client = Mock()
         master = object()
@@ -22,9 +50,14 @@ class StrategyRunnerTests(unittest.TestCase):
 
         with patch.object(breakout, "scan", return_value=breakout_result) as scan_breakout:
             with patch.object(trend_pullback, "scan", return_value=pullback_result) as scan_pullback:
-                result = strategy_runner.run_cycle(
-                    client, master, prep, universe, exclude, prep["expiry"], day, now, fired
-                )
+                with patch.object(
+                    strategy_runner.intraday_multiframe_strategy,
+                    "monitor_positions",
+                    return_value=[],
+                ) as monitor_positions:
+                    result = strategy_runner.run_cycle(
+                        client, master, prep, universe, exclude, prep["expiry"], day, now, fired
+                    )
 
         self.assertEqual(result, {
             "breakout": breakout_result,
@@ -35,6 +68,7 @@ class StrategyRunnerTests(unittest.TestCase):
         self.assertEqual(scan_breakout.call_args.kwargs["now"], now)
         self.assertFalse(scan_breakout.call_args.kwargs["ignore_entry_cutoff"])
         self.assertEqual(scan_pullback.call_args.args[6], now)
+        monitor_positions.assert_called_once_with(client, day, now)
 
     def test_extended_breakout_window_does_not_extend_trend_pullback(self):
         client = Mock()

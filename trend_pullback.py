@@ -351,13 +351,6 @@ def scan(dh, master, universe, exclude, expiry, day, now, fired):
             failed = ", ".join(result["fails"]) or "all checks passed"
             print(f"  {result['verdict']:8} {result['symbol']:12} "
                   f"{result.get('ltp', ''):>9} | {failed}")
-    summary = (f"Trend Pullback scan complete - {snapshot['scan_time']} IST\n"
-               f"Candidates: {len(results)} | BUY: {counts['BUY_']} | "
-               f"WATCH: {counts['WATCH_']} | SKIP: {counts['SKIP']}\n"
-               + ("\n".join(f"{r['verdict']} {r['symbol']} @ {r['ltp']}"
-                            for r in buys) if buys else "No BUY recommendations this scan.")
-               + "\nRecommendations only; no orders were placed.")
-    _notify(summary)
     return snapshot
 
 
