@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import struct
 import tempfile
 import unittest
@@ -87,6 +88,33 @@ class PaperQuoteFeedTests(unittest.TestCase):
                     "client",
                     "token",
                     performance_date,
+                )
+
+                self.assertEqual(
+                    recorder._instrument_list(connection),
+                    {("NSE_EQ", 123), ("NSE_FNO", 456)},
+                )
+            finally:
+                connection.close()
+
+    def test_instrument_list_subscribes_to_open_multiframe_signal_contracts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "ledger.sqlite3"
+            connection = connect(database)
+            try:
+                signal_path = Path(directory) / (
+                    "daily_hourly_15m_signals_2026-10-22.jsonl"
+                )
+                signal_path.write_text(
+                    json.dumps({
+                        "status": "paper_entry_signal_sent",
+                        "underlying_security_id": 123,
+                        "option": {"security_id": 456},
+                    }) + "\n",
+                    encoding="utf-8",
+                )
+                recorder = DhanQuoteRecorder(
+                    database, "client", "token", dt.date(2026, 10, 22)
                 )
 
                 self.assertEqual(

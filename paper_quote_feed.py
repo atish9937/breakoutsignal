@@ -113,6 +113,15 @@ class DhanQuoteRecorder:
                 SELECT option_segment AS exchange_segment, option_security_id AS security_id
                 FROM paper_trades
                 WHERE session_date = ? AND option_security_id IS NOT NULL
+                UNION ALL
+                SELECT 'NSE_EQ' AS exchange_segment, underlying_security_id AS security_id
+                FROM paper_option_positions
+                WHERE strategy = 'swing_option' AND status = 'open'
+                UNION ALL
+                SELECT option_segment AS exchange_segment, option_security_id AS security_id
+                FROM paper_option_positions
+                WHERE strategy = 'swing_option' AND status = 'open'
+                  AND option_security_id IS NOT NULL
             )
             """,
             (self.session_date.isoformat(), self.session_date.isoformat()),
@@ -121,6 +130,33 @@ class DhanQuoteRecorder:
         for segment, security_id in rows:
             if segment in EXCHANGE_SEGMENTS and security_id:
                 result.add((segment, int(security_id)))
+        signal_path = self.database.parent / (
+            f"daily_hourly_15m_signals_{self.session_date.isoformat()}.jsonl"
+        )
+        if signal_path.exists():
+            try:
+                with signal_path.open(encoding="utf-8") as stream:
+                    for line in stream:
+                        if not line.strip():
+                            continue
+                        try:
+                            signal = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if signal.get("status") != "paper_entry_signal_sent":
+                            continue
+                        underlying_id = signal.get("underlying_security_id")
+                        option_id = (signal.get("option") or {}).get("security_id")
+                        if underlying_id:
+                            result.add(("NSE_EQ", int(underlying_id)))
+                        if option_id:
+                            result.add(("NSE_FNO", int(option_id)))
+            except OSError as exc:
+                print(
+                    f"Dhan quote recorder could not read 15-minute signals "
+                    f"({type(exc).__name__}).",
+                    file=sys.stderr,
+                )
         return result
 
     @staticmethod

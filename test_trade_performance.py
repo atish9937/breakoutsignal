@@ -158,6 +158,60 @@ class TradePerformanceTests(unittest.TestCase):
         self.assertIsNotNone(row["target_2_at"])
         self.assertEqual(row["last_price"], 108)
 
+    def test_pending_entry_ignores_pre_entry_stop_and_entry_candle(self):
+        self.add_buy()
+        self.connection.execute(
+            "UPDATE paper_trades SET entry_at = NULL"
+        )
+        self.connection.commit()
+        times = pd.DatetimeIndex(
+            ["2026-10-21 09:21", "2026-10-21 09:22", "2026-10-21 09:23"],
+            tz="Asia/Kolkata",
+        )
+        candles = pd.DataFrame(
+            [
+                {"open": 96, "high": 99, "low": 94, "close": 96},
+                {"open": 100, "high": 106, "low": 94, "close": 101},
+                {"open": 100, "high": 101, "low": 94, "close": 96},
+            ],
+            index=times,
+        )
+        dhan = Mock()
+        dhan.intraday.return_value = candles
+
+        performance.update_open_trades(
+            self.connection,
+            dhan,
+            SESSION,
+            dt.datetime(2026, 10, 21, 9, 27, tzinfo=IST),
+        )
+
+        row = self.connection.execute("SELECT * FROM paper_trades").fetchone()
+        events = self.connection.execute(
+            "SELECT event FROM paper_trade_events ORDER BY candle_time"
+        ).fetchall()
+        self.assertEqual(row["status"], "stop_before_t1")
+        self.assertEqual(row["entry_at"], "2026-10-21T09:22:00+05:30")
+        self.assertIsNone(row["target_1_at"])
+        self.assertEqual([event["event"] for event in events], ["none", "none", "stop_before_t1"])
+
+    def test_import_saved_signals_handles_full_timestamp_entry(self):
+        saved = self.root / "signals.jsonl"
+        saved.write_text(
+            '{"symbol":"AAA","side":"CE","time":"2026-10-21T09:20:20+05:30",'
+            '"ltp":100,"plan":{"entry":100,"stop":95,"t1":105,"t2":110}}\n',
+            encoding="utf-8",
+        )
+
+        inserted = performance.import_saved_signals(
+            self.connection, "breakout", saved, {"AAA": 123}, SESSION
+        )
+
+        row = self.connection.execute("SELECT * FROM paper_trades").fetchone()
+        self.assertEqual(inserted, 1)
+        self.assertEqual(row["signal_time"], "2026-10-21T09:20:20+05:30")
+        self.assertEqual(row["entry_at"], row["signal_time"])
+
     def test_report_has_both_strategy_sections_and_escapes_symbol(self):
         self.add_buy(symbol="<AAA>")
         rows = performance._report_rows(self.connection, SESSION)
@@ -170,7 +224,39 @@ class TradePerformanceTests(unittest.TestCase):
         self.assertIn("Last price", report)
         self.assertIn("Option contract", report)
         self.assertIn("Signal option bid/ask", report)
+        self.assertIn("T1 hit rate", report)
+        self.assertNotIn("T1 win rate", report)
         self.assertIn("No", report)
+
+    def test_report_includes_separate_multiframe_paper_outcomes(self):
+        signals = [{
+            "strategy": "daily_hourly_15m",
+            "symbol": "AAA",
+            "side": "CE",
+            "signal_time": "2026-10-21T10:05:20+05:30",
+            "expiry": "2026-10-29",
+            "option": {"strike": 100, "bid": 10.0, "ask": 10.2, "lot_size": 50},
+            "underlying_entry": 100,
+            "underlying_stop": 95,
+            "underlying_target": 110,
+            "underlying_exit_reference": 110,
+            "option_exit_quote": {"bid": 11.5, "ask": 11.7},
+            "exit_reason": "underlying 2R target",
+            "exit_time": "2026-10-21T11:05:00+05:30",
+            "status": "paper_exit_signal_sent",
+        }]
+
+        report = performance.render_html(
+            [],
+            SESSION,
+            dt.datetime(2026, 10, 21, 15, 35, tzinfo=IST),
+            signals,
+        )
+
+        self.assertIn("15-minute Long Option (same-day, paper)", report)
+        self.assertIn("Underlying 2R target", report)
+        self.assertIn("65.00 / lot", report)
+        self.assertIn("Positive indicative option quote P&amp;L", report)
 
     def test_archives_post_signal_underlying_and_option_one_minute_candles(self):
         self.add_buy()

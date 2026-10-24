@@ -77,7 +77,7 @@ UNIX / CRON
       0 9 * * 1-5 /var/www/breakoutsignal/run_all_unix.sh >> /var/www/breakoutsignal/scanner_out/cron.log 2>&1
     This starts both strategies at 09:00 IST; they scan sequentially using one Dhan client
     every five minutes from 09:20 through 12:35 IST (entry cutoff 12:30). The combined runner
-    continues tracking saved BUY recommendations through 15:10 IST and sends the daily
+    continues tracking saved BUY recommendations through 15:35 IST and sends the daily
     HTML performance report to TELEGRAM_CHAT_ID. It saves the SQLite ledger and HTML report
     under scanner_out/. Strategy checks run against the same candle-close time and shared
     API limiter.
@@ -88,7 +88,7 @@ UNIX / CRON
     12:30 entry cutoff, add --ignore-entry-cutoff to the combined runner cron command.
     The combined runner records both strategies' BUY recommendations in a local SQLite
     ledger, checks subsequent completed 1-minute underlying candles, and sends a colored
-    HTML performance report to Telegram by 15:10 IST. During the session, a Dhan WebSocket
+    HTML performance report to Telegram after 15:35 IST. During the session, a Dhan WebSocket
     recorder stores sampled option/underlying LTP and best bid/ask; after report delivery,
     Dhan's historical chart API archives post-signal 1-minute OHLC for the option and
     underlying. The HTML file and ledger are saved in scanner_out/. Install requirements.txt
@@ -117,7 +117,7 @@ RUN
     python strategy_runner.py --once            # one cycle of both strategies
     python breakout_scanner.py                  # breakout strategy only, standalone
     python breakout_scanner.py --once           # one scan now (for testing)
-    python strategy_runner.py --ignore-entry-cutoff  # breakout BUY cutoff 15:00; daily report by 15:10 IST
+    python strategy_runner.py --ignore-entry-cutoff  # breakout BUY cutoff 15:00; daily report after 15:35 IST
     python strategy_runner.py --report-only          # retry/send today's saved HTML report
     python breakout_scanner.py --exclude TECHM,WIPRO   # skip stocks (results today / F&O ban)
     python breakout_scanner.py --universe nifty100      # which stocks to scan (default nifty50)
@@ -746,6 +746,11 @@ def nearest_level(p: dict, side: str, price: float) -> float:
     return next((x for x in lv if x < price), lv[-1])
 
 
+def _live_price_beyond_trigger(side: str, price: float, trigger: float) -> bool:
+    sign = 1 if side == "CE" else -1
+    return sign * (price - trigger) > 0
+
+
 def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
              ignore_entry_cutoff=False):
     p = prep["stocks"][sym]
@@ -806,22 +811,27 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
     # Everything in this block is MECHANICAL (a formula on Dhan data) and gates the verdict -
     # it defines what "a fresh box breakout" even means, it isn't a judgment call.
     beyond = sign * (last["close"] - level) > 0
+    live_price_beyond = _live_price_beyond_trigger(side, ltp, level)
     crossed_recent = any(sign * (x - level) <= 0 for x in c["close"].iloc[-3:-1])
-    triggered = beyond and crossed_recent
+    triggered = beyond and live_price_beyond and crossed_recent
     chase_pct = sign * (ltp - level) / level * 100
     dist_pct = -chase_pct  # % still to go to reach the level (positive = not reached)
     res["dist_to_trigger_pct"] = r2(dist_pct)
     res["triggered"] = bool(triggered)
+    res["live_price_beyond_trigger"] = bool(live_price_beyond)
     if triggered:
         passes.append(f"5-min close {last['close']:.2f} beyond {level:.2f}")
+    elif beyond and not live_price_beyond:
+        fails.append(f"live price {ltp:.2f} has fallen back across trigger {level:.2f}")
     elif beyond:
         fails.append("broke out more than 2 candles ago (not fresh)")
     else:
         fails.append(f"not triggered ({dist_pct:.2f}% to go)")
     trigger_ok = record_check(
         "Fresh breakout",
-        f"last close {last['close']:.2f}; trigger {level:.2f}; recent cross={crossed_recent}",
-        "completed 5-min close beyond trigger, crossed within last 2 candles",
+        f"last close {last['close']:.2f}; live price {ltp:.2f}; trigger {level:.2f}; "
+        f"recent cross={crossed_recent}",
+        "completed 5-min close and current price beyond trigger; crossed within last 2 candles",
         triggered,
     )
     # warn when the level was already crossed earlier today and price fell back (failed breakout)
@@ -830,9 +840,10 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
         res["level_rejected_today"] = True
         fails.append(f"level already broken today (day {'high' if side == 'CE' else 'low'} "
                      f"{day_ext:.2f}) and price fell back - failed breakout")
-    chase_ok = record_check("Chase limit", f"{max(chase_pct, 0):.2f}%",
-                            f"<= {CONFIG['max_chase_pct']:.2f}%", chase_pct <= CONFIG["max_chase_pct"])
-    (passes if chase_ok else fails).append(f"chase {max(chase_pct,0):.2f}%")
+    chase_ok = record_check("Chase limit", f"{chase_pct:.2f}%",
+                            f"0% to {CONFIG['max_chase_pct']:.2f}%",
+                            0 <= chase_pct <= CONFIG["max_chase_pct"])
+    (passes if chase_ok else fails).append(f"chase {chase_pct:.2f}%")
     volume_current = f"{vol_ratio:.2f}x" if vol_ratio is not None else "unavailable"
     vol_ok = record_check("Breakout volume", volume_current, "> 1.00x previous 3-candle average",
                           vol_ratio is not None and vol_ratio > 1.0)

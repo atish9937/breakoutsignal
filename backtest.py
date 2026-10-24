@@ -382,9 +382,10 @@ def _signal_record(symbol: str, side: str, day: dt.date, decision_time: pd.Times
     prep = daily_setup
     level = scanner.nearest_level(prep, side, previous_close)
     beyond = sign * (close - level) > 0
+    live_price_beyond = scanner._live_price_beyond_trigger(side, close, level)
     crossed_recent = any(sign * (float(value) - level) <= 0
                          for value in bars["close"].iloc[max(0, i - 2):i])
-    fresh = beyond and crossed_recent
+    fresh = beyond and live_price_beyond and crossed_recent
     if not beyond or (not fresh and "fresh_breakout" not in disabled):
         return None
 
@@ -414,7 +415,7 @@ def _signal_record(symbol: str, side: str, day: dt.date, decision_time: pd.Times
     checks = {
         "atr_room": atr_used <= scanner.CONFIG["max_atr_used"],
         "fresh_breakout": fresh,
-        "chase_limit": chase <= scanner.CONFIG["max_chase_pct"],
+        "chase_limit": 0 <= chase <= scanner.CONFIG["max_chase_pct"],
         "breakout_volume": volume_ratio > 1.0,
         "entry_time": _within_entry_window(decision_time),
         "quality_score": quality >= scanner.CONFIG["min_recommend_score"],
@@ -449,6 +450,7 @@ def _signal_record(symbol: str, side: str, day: dt.date, decision_time: pd.Times
     return {
         "symbol": symbol, "side": side, "date": str(day),
         "signal_time": decision_time.strftime("%H:%M:%S"),
+        "live_price_proxy": "completed 5-minute candle close",
         "signal_index": i, "level": level, "signal_close": close,
         "atr": a, "atr_used": atr_used, "chase_pct": chase,
         "volume_ratio": volume_ratio, "quality": quality, "factors": factors,
@@ -456,8 +458,24 @@ def _signal_record(symbol: str, side: str, day: dt.date, decision_time: pd.Times
     }
 
 
+DEFAULT_EXIT = {"t1_r": None, "t2_r": None, "t1_fraction": 0.5,
+                "be_trigger_r": None, "trail_r": None}
+
+# Research-only exit rules compared against the live 50% T1 / T2 / breakeven plan.
+EXIT_VARIANTS = {
+    "live_plan": {},
+    "full_exit_at_t1": {"t1_fraction": 1.0},
+    "be_after_1r": {"be_trigger_r": 1.0},
+    "t1_1r_t2_2r": {"t1_r": 1.0, "t2_r": 2.0},
+    "runner_to_close": {"t2_r": float("inf")},
+    "trail_1r_after_t1": {"t2_r": float("inf"), "trail_r": 1.0},
+}
+
+
 def _execute_trade(signal: dict, bars: pd.DataFrame, slippage_bps: float,
-                   cost_bps: float, disable_chase: bool = False) -> dict | None:
+                   cost_bps: float, disable_chase: bool = False,
+                   exit_rules: dict | None = None) -> dict | None:
+    rules = {**DEFAULT_EXIT, **(exit_rules or {})}
     entry_index = signal["signal_index"] + 1
     if entry_index >= len(bars):
         return None
@@ -471,12 +489,16 @@ def _execute_trade(signal: dict, bars: pd.DataFrame, slippage_bps: float,
     entry = raw_entry * (1 + sign * slip)
     risk = scanner.CONFIG["stop_atr_mult"] * signal["atr"]
     stop = entry - sign * risk
-    t1 = entry + sign * scanner.CONFIG["t1_r"] * risk
-    t2 = entry + sign * scanner.CONFIG["t2_r"] * risk
+    t1_r = rules["t1_r"] if rules["t1_r"] is not None else scanner.CONFIG["t1_r"]
+    t2_r = rules["t2_r"] if rules["t2_r"] is not None else scanner.CONFIG["t2_r"]
+    t1_fraction = rules["t1_fraction"]
+    t1 = entry + sign * t1_r * risk
+    t2 = entry + sign * t2_r * risk if math.isfinite(t2_r) else None
     if signal.get("target_cap") is not None:
         cap = signal["target_cap"]
         t1 = min(t1, cap) if sign == 1 else max(t1, cap)
-        t2 = min(t2, cap) if sign == 1 else max(t2, cap)
+        if t2 is not None:
+            t2 = min(t2, cap) if sign == 1 else max(t2, cap)
     future = bars.iloc[entry_index:].loc[lambda frame: frame.index.time <= EXIT_LAST_BAR_START]
     if future.empty:
         return None
@@ -485,6 +507,8 @@ def _execute_trade(signal: dict, bars: pd.DataFrame, slippage_bps: float,
     realized = 0.0
     costs = entry * cost_bps / 10000
     t1_taken = False
+    be_armed = False
+    best = entry
     exit_reason = "eod"
     exit_fills = []
     last_close = float(future["close"].iloc[-1])
@@ -505,7 +529,10 @@ def _execute_trade(signal: dict, bars: pd.DataFrame, slippage_bps: float,
         if stop_hit:
             opening = float(bar["open"])
             stop_fill = min(stop, opening) if sign == 1 else max(stop, opening)
-            stop_reason = "breakeven" if t1_taken else "stop"
+            stop_reason = (
+                "trail" if t1_taken and rules["trail_r"] else
+                "breakeven" if t1_taken or be_armed else "stop"
+            )
             realized += close_piece(remaining, stop_fill, timestamp, stop_reason)
             remaining = 0
             exit_reason = stop_reason
@@ -513,9 +540,13 @@ def _execute_trade(signal: dict, bars: pd.DataFrame, slippage_bps: float,
         if not t1_taken:
             t1_hit = high >= t1 if sign == 1 else low <= t1
             if t1_hit:
-                realized += close_piece(0.5, t1, timestamp, "t1")
-                remaining = 0.5
+                realized += close_piece(t1_fraction, t1, timestamp, "t1")
+                remaining = 1.0 - t1_fraction
                 t1_taken = True
+                if remaining <= 0:
+                    remaining = 0
+                    exit_reason = "t1"
+                    break
                 stop = entry
                 # With OHLC bars, conservatively assume breakeven preceded T2 if both were touched.
                 be_hit = low <= stop if sign == 1 else high >= stop
@@ -526,11 +557,22 @@ def _execute_trade(signal: dict, bars: pd.DataFrame, slippage_bps: float,
                     realized += close_piece(remaining, be_fill, timestamp, "breakeven")
                     remaining = 0
                     break
-        if t1_taken and remaining and (high >= t2 if sign == 1 else low <= t2):
+        if t1_taken and remaining and t2 is not None and (
+                high >= t2 if sign == 1 else low <= t2):
             realized += close_piece(remaining, t2, timestamp, "t2")
             remaining = 0
             exit_reason = "t2"
             break
+        # Stop changes take effect from the next candle, never the one that triggered them.
+        favorable = high if sign == 1 else low
+        best = max(best, favorable) if sign == 1 else min(best, favorable)
+        if (rules["be_trigger_r"] is not None and not t1_taken and not be_armed
+                and sign * (best - entry) >= rules["be_trigger_r"] * risk):
+            be_armed = True
+            stop = entry
+        if t1_taken and rules["trail_r"]:
+            trailed = best - sign * rules["trail_r"] * risk
+            stop = max(stop, trailed) if sign == 1 else min(stop, trailed)
     if remaining:
         realized += close_piece(remaining, last_close, future.index[-1], "eod")
 
@@ -548,7 +590,8 @@ def _execute_trade(signal: dict, bars: pd.DataFrame, slippage_bps: float,
 
 
 def _scenario_trades(data: dict, start: dt.date, end: dt.date,
-                     disabled: set[str], slippage_bps: float, cost_bps: float) -> list[dict]:
+                     disabled: set[str], slippage_bps: float, cost_bps: float,
+                     exit_rules: dict | None = None) -> list[dict]:
     events: dict[tuple[dt.date, pd.Timestamp], list[dict]] = {}
     for symbol, bundle in data.items():
         daily, intraday = bundle["daily"], bundle["intraday"]
@@ -593,7 +636,8 @@ def _scenario_trades(data: dict, start: dt.date, end: dt.date,
             bars = data[signal["symbol"]]["intraday"]
             day_bars = bars.loc[_day_key(bars.index, dt.date.fromisoformat(signal["date"]))]
             trade = _execute_trade(signal, day_bars, slippage_bps, cost_bps,
-                                   disable_chase="chase_limit" in disabled)
+                                   disable_chase="chase_limit" in disabled,
+                                   exit_rules=exit_rules)
             if trade:
                 trade["option_pnl"] = _option_pnl(
                     signal, trade, data[signal["symbol"]].get("options", {}),
@@ -693,6 +737,7 @@ def run(args: argparse.Namespace) -> dict:
             "pnl_scope": "Underlying R-multiples are reported alongside option premium return per unit. Option exits use the fixed ATM strike selected at signal, but historical lot sizes are unavailable so no rupee-per-lot P&L is reported.",
             "option_exit_assumption": "Enter the selected fixed-strike option at the next 5-minute candle open; exit option at the 5-minute close of each underlying stop/target/EOD exit bar. Missing fixed-strike candles make option P&L unavailable for that trade.",
             "fills": "Signal uses a completed 5-minute close; entry is next 5-minute candle open.",
+            "live_trigger_limit": "Historical 5-minute candle close is used as a proxy for live price. Intrabar live-price reclaims cannot be reconstructed from this dataset.",
             "exits": "50% at T1 (1.5R); remaining 50% stop moves to entry, then T2 (2.5R), breakeven, or 15:15 close.",
             "ambiguous_candles": "Stop is prioritized over target; after T1, breakeven is prioritized over T2 within the same candle.",
             "slippage_bps_per_fill": args.slippage_bps,
@@ -707,8 +752,29 @@ def run(args: argparse.Namespace) -> dict:
         "variant_trades_not_in_baseline": {"count": len(added), "trades": added},
     }
     OUT.mkdir(exist_ok=True)
+    if getattr(args, "exit_variants", False):
+        comparison = {}
+        for name, rules in EXIT_VARIANTS.items():
+            trades = _scenario_trades(data, args.start, args.end, set(),
+                                      args.slippage_bps, args.cost_bps, rules)
+            comparison[name] = {"rules": {k: (None if v == float("inf") else v)
+                                          for k, v in rules.items()},
+                                "metrics": _metrics(trades),
+                                "option_metrics": _option_metrics(trades),
+                                "exit_reasons": {
+                                    reason: sum(t["exit_reason"] == reason for t in trades)
+                                    for reason in sorted({t["exit_reason"] for t in trades})},
+                                "trades": trades}
+        result["exit_variants"] = comparison
     output_path = OUT / f"backtest_{args.start}_{args.end}.json"
     output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    if "exit_variants" in result:
+        print(f"\nExit-rule comparison (same entries) | {args.start} through {args.end}")
+        print(f"{'Exit rule':20} {'Trades':>7} {'Win%':>8} {'Total R':>9} {'Avg R':>9} {'PF':>8} {'Max DD R':>10}")
+        for name, row in result["exit_variants"].items():
+            m = row["metrics"]
+            print(f"{name:20} {m['trades']:7} {m['win_rate_pct']:8.2f} {m['total_r']:9.2f} "
+                  f"{m['average_r']:9.3f} {str(m['profit_factor']):>8} {m['max_drawdown_r']:10.2f}")
     print(f"\nHistorical scanner-filter backtest | {args.start} through {args.end}")
     print(f"Symbols: {', '.join(symbols)}")
     print(f"Disabled filters: {', '.join(sorted(args.disabled)) or 'none (baseline only)'}")
@@ -742,6 +808,8 @@ def main() -> None:
                         help="adverse slippage per fill in basis points of each instrument's price (default: 5)")
     parser.add_argument("--cost-bps", type=float, default=0.0,
                         help="estimated cost per fill in basis points of each instrument's price (default: 0)")
+    parser.add_argument("--exit-variants", action="store_true",
+                        help="also replay the same entries under alternative exit rules (research only)")
     args = parser.parse_args()
     try:
         run(args)

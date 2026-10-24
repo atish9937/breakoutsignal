@@ -15,13 +15,14 @@ import breakout_scanner as breakout
 import intraday_multiframe_strategy
 import trend_pullback
 import trade_performance
+import option_positions
 import swing_option_strategy
 from paper_quote_feed import DhanQuoteRecorder
 
 
 STRATEGY_START = dt.time(9, 20)
 STRATEGY_END = dt.time(12, 35)
-REPORT_TIME = dt.time(15, 10)
+REPORT_TIME = dt.time(15, 35)
 SWING_REPORT_TIME = dt.time(15, 35)
 
 
@@ -139,7 +140,36 @@ def run_cycle(dh, master, prep, universe, exclude, trend_expiry, day, now, fired
             file=sys.stderr,
         )
         traceback.print_exc()
+    sync_option_positions(ledger, dh, day, now)
     return results
+
+
+def sync_option_positions(ledger, dh, day, now):
+    """Mirror 15m signals, open confirmed swing trades, and advance swing lifecycles."""
+    if ledger is None:
+        return
+    def quote_fetcher(position):
+        chain = dh.option_chain(
+            int(position["underlying_security_id"]), position["option_expiry"]
+        )
+        return intraday_multiframe_strategy._contract_quote(
+            chain, position["side"], float(position["option_strike"])
+        )
+    try:
+        option_positions.sync_multiframe_signals(
+            ledger, breakout.OUT / f"daily_hourly_15m_signals_{day}.jsonl", day
+        )
+        option_positions.record_swing_confirmations(ledger, breakout.OUT)
+        option_positions.update_swing_positions(ledger, dh, now, quote_fetcher)
+        option_positions.mark_stale_unresolved(ledger, day)
+    except breakout.DhanAuthError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"Option-position tracking failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        traceback.print_exc()
 
 
 def run_swing_next_session_checks(dh, master, day, now):
@@ -209,7 +239,7 @@ def main():
     if args.report_only:
         report_now = dt.datetime.now(breakout.IST)
         if report_now.time() < REPORT_TIME:
-            sys.exit("--report-only is available after 15:10 IST so the day's tracking is complete.")
+            sys.exit("--report-only is available after 15:35 IST so same-day exits are included.")
         try:
             report_path = trade_performance.finalize_day(
                 ledger,
@@ -280,7 +310,7 @@ def main():
     if args.ignore_entry_cutoff:
         print("Running breakout and trend-pullback strategies every 5 minutes from "
               "09:20-12:35 IST; breakout BUY cutoff is 15:00 IST. The runner tracks "
-              "open recommendations and sends the daily HTML report by 15:10 IST. "
+              "open recommendations and sends the daily HTML report after 15:35 IST. "
               "No live orders are placed. Ctrl+C to stop.")
     else:
         print("Running breakout and trend-pullback strategies every 5 minutes from "
@@ -291,6 +321,18 @@ def main():
         quote_recorder.stop()
         report_now = dt.datetime.now(breakout.IST)
         trade_performance.update_open_trades(ledger, dh, day, report_now)
+        try:
+            archived = trade_performance.archive_one_minute_candles(
+                ledger, dh, day, dt.datetime.now(breakout.IST)
+            )
+            print(f"Archived {archived} post-signal one-minute instrument candles.")
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"One-minute candle archive failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            traceback.print_exc()
+        sync_option_positions(ledger, dh, day, report_now)
         report_path = trade_performance.finalize_day(
             ledger,
             day,
@@ -299,21 +341,6 @@ def main():
             os.getenv("TELEGRAM_CHAT_ID"),
             report_now,
         )
-        try:
-            archived = trade_performance.archive_one_minute_candles(
-                ledger, dh, day, dt.datetime.now(breakout.IST)
-            )
-            print(
-                f"Archived {archived} post-signal one-minute instrument candles "
-                "after report delivery."
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"Post-report one-minute candle archive failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            traceback.print_exc()
         swing_scan_time = dt.datetime.combine(
             day, SWING_REPORT_TIME, breakout.IST
         )

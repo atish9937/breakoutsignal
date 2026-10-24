@@ -468,6 +468,7 @@ def monitor_next_session(dh, master: pd.DataFrame, day: dt.date,
                     continue
                 candidate["next_session_status"] = "trigger_confirmed"
                 candidate["confirmed_at"] = hit.index[0].isoformat()
+                candidate["confirmed_underlying_close"] = float(hit.iloc[0]["close"])
                 candidate["refreshed_option"] = refreshed
                 changed = True
                 token = os.getenv("TELEGRAM_BOT_TOKEN")

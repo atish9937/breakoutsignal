@@ -90,13 +90,13 @@ class StrategyRunnerTests(unittest.TestCase):
         scan_pullback.assert_not_called()
 
     def test_both_schedules_keep_runner_alive_until_the_daily_report(self):
-        self.assertEqual(strategy_runner.cycle_end(True), dt.time(15, 10))
-        self.assertEqual(strategy_runner.cycle_end(False), dt.time(15, 10))
+        self.assertEqual(strategy_runner.cycle_end(True), dt.time(15, 35))
+        self.assertEqual(strategy_runner.cycle_end(False), dt.time(15, 35))
 
     def test_report_deadline_uses_seconds_not_only_hour_and_minute(self):
-        before = dt.datetime(2026, 10, 19, 15, 9, 59, tzinfo=breakout.IST)
-        at_deadline = dt.datetime(2026, 10, 19, 15, 10, 0, tzinfo=breakout.IST)
-        after_deadline = dt.datetime(2026, 10, 19, 15, 10, 20, tzinfo=breakout.IST)
+        before = dt.datetime(2026, 10, 19, 15, 34, 59, tzinfo=breakout.IST)
+        at_deadline = dt.datetime(2026, 10, 19, 15, 35, 0, tzinfo=breakout.IST)
+        after_deadline = dt.datetime(2026, 10, 19, 15, 35, 20, tzinfo=breakout.IST)
         self.assertFalse(strategy_runner.report_due(before))
         self.assertTrue(strategy_runner.report_due(at_deadline))
         self.assertTrue(strategy_runner.report_due(after_deadline))

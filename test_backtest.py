@@ -104,6 +104,49 @@ class BacktestExecutionTests(unittest.TestCase):
         self.assertAlmostEqual(trade["r_multiple"], 2.0, places=4)
 
 
+class ExitVariantTests(unittest.TestCase):
+    make_signal = BacktestExecutionTests.make_signal
+    make_bars = BacktestExecutionTests.make_bars
+    def test_empty_rules_match_default_plan(self):
+        bars = self.make_bars([
+            [100, 101, 99, 100, 1000],
+            [100, 126, 101, 125, 1000],
+        ])
+        base = backtest._execute_trade(self.make_signal(), bars, 0, 0)
+        same = backtest._execute_trade(self.make_signal(), bars, 0, 0,
+                                       exit_rules=backtest.EXIT_VARIANTS["live_plan"])
+        self.assertEqual(base["r_multiple"], same["r_multiple"])
+        self.assertEqual(base["exit_reason"], same["exit_reason"])
+
+    def test_full_exit_at_t1(self):
+        bars = self.make_bars([
+            [100, 101, 99, 100, 1000],
+            [100, 116, 100, 105, 1000],
+        ])
+        trade = backtest._execute_trade(self.make_signal(), bars, 0, 0,
+                                        exit_rules=backtest.EXIT_VARIANTS["full_exit_at_t1"])
+        self.assertEqual(trade["exit_reason"], "t1")
+        self.assertAlmostEqual(trade["r_multiple"], 1.5, places=4)
+
+    def test_breakeven_after_one_r_applies_from_next_bar(self):
+        bars = self.make_bars([
+            [100, 101, 99, 100, 1000],
+            [100, 111, 89, 100, 1000],
+            [100, 101, 99, 100, 1000],
+        ])
+        trade = backtest._execute_trade(self.make_signal(), bars, 0, 0,
+                                        exit_rules=backtest.EXIT_VARIANTS["be_after_1r"])
+        self.assertAlmostEqual(trade["r_multiple"], -1.0, places=4)
+        bars = self.make_bars([
+            [100, 101, 99, 100, 1000],
+            [100, 111, 100, 105, 1000],
+            [105, 106, 99, 100, 1000],
+        ])
+        trade = backtest._execute_trade(self.make_signal(), bars, 0, 0,
+                                        exit_rules=backtest.EXIT_VARIANTS["be_after_1r"])
+        self.assertAlmostEqual(trade["r_multiple"], 0.0, places=4)
+
+
 class DhanRetryTests(unittest.TestCase):
     def test_rolling_option_retries_read_timeout(self):
         client = object.__new__(scanner.Dhan)
@@ -261,6 +304,11 @@ class BacktestSignalTests(unittest.TestCase):
         )
         self.assertIsNone(baseline)
         self.assertIsNotNone(without_fresh)
+        self.assertFalse(without_fresh["checks"]["fresh_breakout"])
+        self.assertEqual(
+            without_fresh["live_price_proxy"],
+            "completed 5-minute candle close",
+        )
 
     def test_daily_setup_does_not_use_the_simulated_session(self):
         dates = pd.date_range("2025-01-01", periods=22, freq="D", tz=backtest.IST)

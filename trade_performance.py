@@ -14,8 +14,10 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+import option_positions
 
-SCHEMA_VERSION = 4
+
+SCHEMA_VERSION = 5
 ACTIVE_STATUSES = ("tracking", "t1_hit")
 WIN_STATUSES = ("t1_hit", "t2_hit", "t1_then_breakeven")
 RESOLVED_STATUSES = (*WIN_STATUSES, "stop_before_t1")
@@ -43,6 +45,7 @@ def connect(database: Path) -> sqlite3.Connection:
             side TEXT NOT NULL CHECK (side IN ('CE', 'PE')),
             security_id INTEGER NOT NULL CHECK (security_id > 0),
             signal_time TEXT NOT NULL,
+            entry_at TEXT,
             reference_entry REAL NOT NULL,
             stop_price REAL NOT NULL,
             target_1 REAL NOT NULL,
@@ -140,6 +143,7 @@ def connect(database: Path) -> sqlite3.Connection:
         );
         """
     )
+    connection.executescript(option_positions.SCHEMA_SQL)
     columns = {
         row["name"]
         for row in connection.execute("PRAGMA table_info(paper_trades)").fetchall()
@@ -171,12 +175,17 @@ def connect(database: Path) -> sqlite3.Connection:
         "option_lot_size": "INTEGER",
         "signal_json": "TEXT",
         "data_capture_error": "TEXT",
+        "entry_at": "TEXT",
     }
     for column, definition in new_columns.items():
         if column not in columns:
             connection.execute(
                 f"ALTER TABLE paper_trades ADD COLUMN {column} {definition}"
             )
+            if column == "entry_at":
+                connection.execute(
+                    "UPDATE paper_trades SET entry_at = signal_time WHERE entry_at IS NULL"
+                )
     now = dt.datetime.now(dt.timezone.utc).isoformat()
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)",
@@ -256,15 +265,22 @@ def record_buy_recommendations(
                 file=sys.stderr,
             )
             continue
+        signal_price = _as_number(result.get("ltp"))
+        entry_at = (
+            _timestamp(session_date, scan_time).isoformat()
+            if signal_price is not None
+            and (signal_price >= entry if side == "CE" else signal_price <= entry)
+            else None
+        )
 
         cursor = connection.execute(
             """
             INSERT OR IGNORE INTO paper_trades (
-                strategy, session_date, symbol, side, security_id, signal_time,
+                strategy, session_date, symbol, side, security_id, signal_time, entry_at,
                     reference_entry, stop_price, target_1, target_2, option_security_id,
                     option_expiry, option_entry_ltp, option_entry_bid, option_entry_ask,
                     option_lot_size, signal_json, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tracking', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tracking', ?, ?)
             """,
             (
                 strategy,
@@ -273,6 +289,7 @@ def record_buy_recommendations(
                 side,
                 int(security_id),
                 _timestamp(session_date, scan_time).isoformat(),
+                entry_at,
                 entry,
                 stop,
                 target_1,
@@ -345,18 +362,26 @@ def import_saved_signals(
             signal_time = signal.get("scan_time") or signal.get("time")
             if signal_time and len(signal_time) <= 8:
                 signal_time = f"{session_date.isoformat()} {signal_time}"
+            signal_price = _as_number(signal.get("ltp"))
+            entry_at = (
+                _timestamp(session_date, signal_time).isoformat()
+                if signal_price is not None
+                and (signal_price >= entry if side == "CE" else signal_price <= entry)
+                else None
+            )
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO paper_trades (
-                    strategy, session_date, symbol, side, security_id, signal_time,
+                    strategy, session_date, symbol, side, security_id, signal_time, entry_at,
                     reference_entry, stop_price, target_1, target_2, option_security_id,
                     option_expiry, option_entry_ltp, option_entry_bid, option_entry_ask,
                     option_lot_size, signal_json, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tracking', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tracking', ?, ?)
                 """,
                 (
                     strategy, session_date.isoformat(), symbol, side, int(security_id),
                     _timestamp(session_date, signal_time).isoformat(),
+                    entry_at,
                     entry, stop, target_1, target_2,
                     (signal.get("option") or {}).get("security_id"),
                     (signal.get("option") or {}).get("expiry"),
@@ -377,6 +402,11 @@ def _crossed(side: str, price: float, level: float, target: bool) -> bool:
     if side == "CE":
         return price >= level if target else price <= level
     return price <= level if target else price >= level
+
+
+def _entry_touched(entry: float, candle: pd.Series) -> bool:
+    high, low = float(candle["high"]), float(candle["low"])
+    return low <= entry <= high
 
 
 def _process_candle(trade: sqlite3.Row, candle: pd.Series) -> tuple[str, str | None]:
@@ -486,8 +516,14 @@ def update_open_trades(
                 ).fetchone()
                 if current_trade["status"] not in ACTIVE_STATUSES:
                     break
-                status, event = _process_candle(current_trade, candle)
                 candle_iso = candle_time.isoformat()
+                entry_at = current_trade["entry_at"]
+                if entry_at is None:
+                    if _entry_touched(current_trade["reference_entry"], candle):
+                        entry_at = candle_iso
+                    status, event = current_trade["status"], "none"
+                else:
+                    status, event = _process_candle(current_trade, candle)
                 recorded_at = dt.datetime.now(dt.timezone.utc).isoformat()
                 connection.execute(
                     """
@@ -523,13 +559,13 @@ def update_open_trades(
                 connection.execute(
                     """
                     UPDATE paper_trades
-                    SET status = ?, target_1_at = ?, target_2_at = ?, stop_at = ?,
+                    SET status = ?, entry_at = ?, target_1_at = ?, target_2_at = ?, stop_at = ?,
                         last_candle_at = ?, last_price = ?, tracking_error = NULL,
                         updated_at = ?
                     WHERE id = ?
                     """,
                     (
-                        status, t1_at, t2_at, stop_at, candle_iso,
+                        status, entry_at, t1_at, t2_at, stop_at, candle_iso,
                         float(candle["close"]), recorded_at, trade["id"],
                     ),
                 )
@@ -667,6 +703,19 @@ def _report_rows(connection: sqlite3.Connection, session_date: dt.date) -> list[
     return connection.execute(
         """
         SELECT t.*,
+            CASE t.status WHEN 't2_hit' THEN t.target_2_at
+                WHEN 't1_hit' THEN t.target_1_at
+                WHEN 'stop_before_t1' THEN t.stop_at
+                WHEN 't1_then_breakeven' THEN t.stop_at
+                ELSE t.last_candle_at END AS premium_exit_ref_at,
+            (SELECT c.close FROM paper_instrument_candles c
+             WHERE c.trade_id = t.id AND c.instrument_type = 'option'
+               AND c.candle_time <= CASE t.status WHEN 't2_hit' THEN t.target_2_at
+                    WHEN 't1_hit' THEN t.target_1_at
+                    WHEN 'stop_before_t1' THEN t.stop_at
+                    WHEN 't1_then_breakeven' THEN t.stop_at
+                    ELSE t.last_candle_at END
+             ORDER BY c.candle_time DESC LIMIT 1) AS option_exit_close,
             (SELECT COUNT(*) FROM paper_market_ticks q
              WHERE q.instrument_segment = t.option_segment
                AND q.security_id = t.option_security_id
@@ -700,7 +749,77 @@ def _metrics(rows: list[sqlite3.Row]) -> dict:
     }
 
 
-def render_html(rows: list[sqlite3.Row], session_date: dt.date, generated_at: dt.datetime) -> str:
+def _load_multiframe_signals(report_dir: Path, session_date: dt.date) -> tuple[list[dict], list[str]]:
+    path = report_dir / f"daily_hourly_15m_signals_{session_date.isoformat()}.jsonl"
+    if not path.exists():
+        return [], []
+    signals = []
+    errors = []
+    with path.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            try:
+                signal = json.loads(line)
+            except json.JSONDecodeError as exc:
+                errors.append(f"Line {line_number}: {exc}")
+                continue
+            if not isinstance(signal, dict):
+                errors.append(f"Line {line_number}: expected a JSON object")
+                continue
+            signals.append(signal)
+    return signals, errors
+
+
+def _multiframe_outcome(signal: dict) -> str:
+    if signal.get("status") != "paper_exit_signal_sent":
+        return "Open at report cutoff"
+    reason = signal.get("exit_reason")
+    if reason == "underlying 2R target":
+        return "Underlying 2R target"
+    if reason == "underlying stop":
+        return "Underlying stop"
+    if reason == "mandatory same-day exit":
+        return "Time exit"
+    return str(reason or "Exit recorded")
+
+
+def _multiframe_premium_estimate(signal: dict) -> float | None:
+    option = signal.get("option") or {}
+    exit_quote = signal.get("option_exit_quote") or {}
+    entry_ask = _as_number(option.get("ask"))
+    exit_bid = _as_number(exit_quote.get("bid"))
+    lot_size = _as_number(option.get("lot_size"))
+    if entry_ask is None or exit_bid is None or lot_size is None:
+        return None
+    if entry_ask <= 0 or exit_bid <= 0 or lot_size <= 0:
+        return None
+    return round((exit_bid - entry_ask) * lot_size, 2)
+
+
+def _trade_premium_pnl(row: sqlite3.Row) -> float | None:
+    """Option 1-minute candle close at the underlying outcome vs the signal-time ask, per lot."""
+    keys = row.keys()
+    if "option_exit_close" not in keys or row["entry_at"] is None:
+        return None
+    pnl, _basis = option_positions._pnl(
+        row["option_entry_ask"], None, row["option_exit_close"], row["option_lot_size"]
+    )
+    return pnl
+
+
+def render_html(
+    rows: list[sqlite3.Row],
+    session_date: dt.date,
+    generated_at: dt.datetime,
+    multiframe_signals: list[dict] | None = None,
+    multiframe_errors: list[str] | None = None,
+    option_rows: list[sqlite3.Row] | None = None,
+    swing_funnel: dict[str, int] | None = None,
+) -> str:
+    option_section = option_positions.render_section(option_rows or [], swing_funnel)
+    multiframe_signals = multiframe_signals or []
+    multiframe_errors = multiframe_errors or []
     summaries = {
         name: _metrics([row for row in rows if row["strategy"] == name])
         for name in ("breakout", "trend_pullback")
@@ -726,6 +845,14 @@ def render_html(rows: list[sqlite3.Row], session_date: dt.date, generated_at: dt
             if row["option_entry_bid"] is not None or row["option_entry_ask"] is not None
             else "Unavailable"
         )
+        entry_status = (
+            row["entry_at"]
+            if row["entry_at"]
+            else "Not reached by report cutoff" if row["status"] == "unresolved"
+            else "Pending"
+        )
+        pnl = _trade_premium_pnl(row)
+        pnl_text = f"{pnl:.2f} / lot" if pnl is not None else "N/A"
         body_rows.append(
             "<tr>"
             f"<td>{html.escape(row['strategy'].replace('_', ' ').title())}</td>"
@@ -733,6 +860,7 @@ def render_html(rows: list[sqlite3.Row], session_date: dt.date, generated_at: dt
             f"<td>{html.escape(row['side'])}</td>"
             f"<td>{html.escape(option_contract)}</td>"
             f"<td>{entry_quote}</td>"
+            f"<td>{html.escape(entry_status)}</td>"
             f"<td>{row['reference_entry']:.2f}</td>"
             f"<td>{row['stop_price']:.2f}</td>"
             f"<td>{row['target_1']:.2f}</td>"
@@ -742,12 +870,96 @@ def render_html(rows: list[sqlite3.Row], session_date: dt.date, generated_at: dt
             f"<td class='status {html.escape(row['status'])}'>{html.escape(labels[row['status']])}</td>"
             f"<td>{'Yes' if row['target_1_at'] else 'No'}</td>"
             f"<td>{'Yes' if row['target_2_at'] else 'No'}</td>"
+            f"<td>{pnl_text}</td>"
             f"<td>{html.escape(row['tracking_error'] or '')}</td>"
             f"<td>{row['option_quote_samples']}</td>"
             f"<td>{row['underlying_quote_samples']}</td>"
             f"<td>{html.escape(row['data_capture_error'] or '')}</td>"
             "</tr>"
         )
+    multiframe_estimates = [
+        estimate for signal in multiframe_signals
+        if (estimate := _multiframe_premium_estimate(signal)) is not None
+    ]
+    multiframe_closed = [
+        signal for signal in multiframe_signals
+        if signal.get("status") == "paper_exit_signal_sent"
+    ]
+    multiframe_wins = sum(estimate > 0 for estimate in multiframe_estimates)
+    multiframe_summary = (
+        "<section class='summary daily_hourly_15m'>"
+        "<h2>15-minute Long Option (same-day, paper)</h2>"
+        "<div class='cards'>"
+        f"<div><b>{len(multiframe_signals)}</b><span>Signals</span></div>"
+        f"<div><b>{len(multiframe_closed)}</b><span>Exit signals recorded</span></div>"
+        f"<div><b>{sum(signal.get('exit_reason') == 'underlying 2R target' for signal in multiframe_signals)}</b>"
+        "<span>Underlying 2R targets</span></div>"
+        f"<div><b>{sum(signal.get('exit_reason') == 'underlying stop' for signal in multiframe_signals)}</b>"
+        "<span>Underlying stops</span></div>"
+        f"<div><b>{sum(signal.get('exit_reason') == 'mandatory same-day exit' for signal in multiframe_signals)}</b>"
+        "<span>Time exits</span></div>"
+        f"<div><b>{multiframe_wins}/{len(multiframe_estimates)}</b>"
+        "<span>Positive indicative option quote P&amp;L (priced exits)</span></div>"
+        "</div></section>"
+    )
+    if multiframe_signals:
+        multiframe_rows = []
+        for signal in multiframe_signals:
+            option = signal.get("option") or {}
+            exit_quote = signal.get("option_exit_quote") or {}
+            estimate = _multiframe_premium_estimate(signal)
+            estimate_text = (
+                f"{estimate:.2f} / lot" if estimate is not None else "N/A"
+            )
+            status = _multiframe_outcome(signal)
+            multiframe_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(signal.get('signal_time') or ''))}</td>"
+                f"<td>{html.escape(str(signal.get('symbol') or ''))}</td>"
+                f"<td>{html.escape(str(signal.get('side') or ''))}</td>"
+                f"<td>{html.escape(str(signal.get('expiry') or ''))} "
+                f"{html.escape(str(option.get('strike') or ''))}</td>"
+                f"<td>{_as_number(option.get('bid')) or 0:.2f} / "
+                f"{_as_number(option.get('ask')) or 0:.2f}</td>"
+                f"<td>{_as_number(signal.get('underlying_entry')) or 0:.2f}</td>"
+                f"<td>{_as_number(signal.get('underlying_stop')) or 0:.2f}</td>"
+                f"<td>{_as_number(signal.get('underlying_target')) or 0:.2f}</td>"
+                f"<td>{_as_number(signal.get('underlying_exit_reference')) or 0:.2f}</td>"
+                f"<td>{_as_number(exit_quote.get('bid')) or 0:.2f} / "
+                f"{_as_number(exit_quote.get('ask')) or 0:.2f}</td>"
+                f"<td>{estimate_text}</td>"
+                f"<td>{html.escape(status)}</td>"
+                f"<td>{html.escape(str(signal.get('exit_time') or ''))}</td>"
+                "</tr>"
+            )
+        multiframe_table = (
+            "<div class='table-wrap'><table><thead><tr>"
+            "<th>Signal time (IST)</th><th>Symbol</th><th>Side</th><th>Option</th>"
+            "<th>Entry bid/ask</th><th>Underlying entry</th><th>Stop</th>"
+            "<th>2R target</th><th>Underlying exit</th><th>Exit bid/ask</th>"
+            "<th>Indicative option P&amp;L / lot</th><th>Outcome</th><th>Exit time (IST)</th>"
+            f"</tr></thead><tbody>{''.join(multiframe_rows)}</tbody></table></div>"
+        )
+    else:
+        multiframe_table = "<p>No 15-minute Long Option signals were recorded for this session.</p>"
+    multiframe_error_note = (
+        "<p class='note'>15-minute signal-file issues: "
+        + html.escape("; ".join(multiframe_errors))
+        + "</p>"
+        if multiframe_errors else ""
+    )
+    quote_sample_count = sum(
+        int(row["option_quote_samples"] or 0)
+        + int(row["underlying_quote_samples"] or 0)
+        for row in rows
+    )
+    quote_capture_note = (
+        "<p class='note'><strong>No live WebSocket quote samples were captured "
+        "for the Breakout/Trend Pullback rows.</strong> Check runner logs for "
+        "the quote-recorder connection or reconnect errors; these rows cannot "
+        "show intraday option quote movement.</p>"
+        if rows and quote_sample_count == 0 else ""
+    )
     sections = []
     for name, metrics in summaries.items():
         label = name.replace("_", " ").title()
@@ -759,7 +971,7 @@ def render_html(rows: list[sqlite3.Row], session_date: dt.date, generated_at: dt
             f"<div><b>{metrics['total']}</b><span>BUY recommendations</span></div>"
             f"<div><b>{metrics['t1']}</b><span>T1 reached</span></div>"
             f"<div><b>{metrics['t2']}</b><span>T2 reached</span></div>"
-            f"<div><b>{rate}</b><span>T1 win rate ({metrics['wins']}/{metrics['resolved']} resolved)</span></div>"
+            f"<div><b>{rate}</b><span>T1 hit rate ({metrics['wins']}/{metrics['resolved']} resolved)</span></div>"
             f"<div><b>{metrics['stopped']}</b><span>Stopped before T1</span></div>"
             f"<div><b>{metrics['unresolved']}</b><span>Unresolved at cutoff</span></div>"
             f"</div></section>"
@@ -769,9 +981,9 @@ def render_html(rows: list[sqlite3.Row], session_date: dt.date, generated_at: dt
         if not rows else
         "<div class='table-wrap'><table><thead><tr>"
         "<th>Strategy</th><th>Symbol</th><th>Side</th><th>Option contract</th>"
-        "<th>Signal option bid/ask</th><th>Reference</th>"
+        "<th>Signal option bid/ask</th><th>Entry reached (IST)</th><th>Reference</th>"
         "<th>Stop</th><th>T1</th><th>T2</th><th>Last price</th><th>Price candle (IST)</th><th>Outcome</th>"
-        "<th>T1 hit</th><th>T2 hit</th><th>Tracking notes</th>"
+        "<th>T1 hit</th><th>T2 hit</th><th>Indicative option P&amp;L (candle close)</th><th>Tracking notes</th>"
         "<th>Option live quote samples</th><th>Underlying live quote samples</th>"
         "<th>Data capture notes</th>"
         f"</tr></thead><tbody>{''.join(body_rows)}</tbody></table></div>"
@@ -802,7 +1014,10 @@ th{{background:#eaf0f7;color:#263b58;}} .status{{font-weight:700;}}
 <p>Generated: {generated_at.astimezone(dt.timezone(dt.timedelta(hours=5, minutes=30))).strftime('%H:%M:%S')} IST</p>
 <p>Recommendations only — no orders were placed.</p></header>
 {''.join(sections)}<h2>Recommendation outcomes</h2>{table}
+{multiframe_summary}<h2>15-minute Long Option outcomes</h2>{multiframe_table}
+{multiframe_error_note}{option_section}{quote_capture_note}
 <p class="note">Underlying outcomes use completed 1-minute candles after the signal; a candle starting before a signal is excluded. If one candle crosses both a stop and target, the stop is counted first. This is still not an actual fill or an option P&amp;L simulation. Dhan's live full-feed samples store option/underlying LTP and best bid/ask during the runner session. Live quote samples can be missing before deployment, during feed outages, or for contracts that Dhan does not return. Historical one-minute candles are archived in the local database after the Telegram report; they contain OHLC, not historical bid/ask or proof of order fill. Capture errors are shown per trade.</p>
+<p class="note">The 15-minute strategy tracks underlying stop/target/time exits separately. Indicative option P&amp;L uses the entry ask and exit bid snapshots multiplied by lot size; it excludes brokerage, taxes, slippage, and fills, and is not a verified result. An absent signal file means no saved signals were available for this report.</p>
 </main></body></html>"""
 
 
@@ -855,11 +1070,24 @@ def finalize_day(
     )
     connection.commit()
     rows = _report_rows(connection, session_date)
+    multiframe_signals, multiframe_errors = _load_multiframe_signals(
+        report_dir, session_date
+    )
+    option_rows = option_positions.report_rows(connection, session_date)
+    funnel = option_positions.swing_funnel(report_dir, session_date)
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / f"paper_performance_{session_date.isoformat()}.html"
     temporary_path = report_path.with_suffix(".html.tmp")
     temporary_path.write_text(
-        render_html(rows, session_date, generated_at),
+        render_html(
+            rows,
+            session_date,
+            generated_at,
+            multiframe_signals,
+            multiframe_errors,
+            option_rows,
+            funnel,
+        ),
         encoding="utf-8",
     )
     os.replace(temporary_path, report_path)
