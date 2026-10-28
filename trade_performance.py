@@ -816,6 +816,7 @@ def render_html(
     multiframe_errors: list[str] | None = None,
     option_rows: list[sqlite3.Row] | None = None,
     swing_funnel: dict[str, int] | None = None,
+    market_tick_count: int | None = None,
 ) -> str:
     option_section = option_positions.render_section(option_rows or [], swing_funnel)
     multiframe_signals = multiframe_signals or []
@@ -953,12 +954,23 @@ def render_html(
         + int(row["underlying_quote_samples"] or 0)
         for row in rows
     )
+    quote_feed_dead = (
+        rows
+        and quote_sample_count == 0
+        and market_tick_count is not None
+        and market_tick_count == 0
+    )
     quote_capture_note = (
-        "<p class='note'><strong>No live WebSocket quote samples were captured "
-        "for the Breakout/Trend Pullback rows.</strong> Check runner logs for "
-        "the quote-recorder connection or reconnect errors; these rows cannot "
-        "show intraday option quote movement.</p>"
-        if rows and quote_sample_count == 0 else ""
+        "<section class='summary' style='background:#fff5f5;border-color:#f1b1a8;'>"
+        "<h2 style='color:#b42318;'>Live quote feed DOWN this session</h2>"
+        "<p class='note'><strong>Zero WebSocket packets were captured for the entire "
+        "session.</strong> No ticks reached paper_market_ticks. The Dhan live feed is "
+        "either not connecting, failing authentication, or silently decoding to garbage. "
+        "Scanner suggestions during this session relied on polled quotes only; option "
+        "live quote columns in this report are empty. Fix the quote recorder before the "
+        "next session (check client_id/access_token, run `python -m paper_quote_feed "
+        "--probe`, review runner logs).</p></section>"
+        if quote_feed_dead else ""
     )
     sections = []
     for name, metrics in summaries.items():
@@ -1075,6 +1087,10 @@ def finalize_day(
     )
     option_rows = option_positions.report_rows(connection, session_date)
     funnel = option_positions.swing_funnel(report_dir, session_date)
+    market_tick_count = connection.execute(
+        "SELECT COUNT(*) FROM paper_market_ticks WHERE session_date = ?",
+        (session_date.isoformat(),),
+    ).fetchone()[0]
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / f"paper_performance_{session_date.isoformat()}.html"
     temporary_path = report_path.with_suffix(".html.tmp")
@@ -1087,10 +1103,18 @@ def finalize_day(
             multiframe_errors,
             option_rows,
             funnel,
+            market_tick_count=market_tick_count,
         ),
         encoding="utf-8",
     )
     os.replace(temporary_path, report_path)
+    if rows and market_tick_count == 0:
+        print(
+            f"LIVE QUOTE FEED DOWN for session {session_date.isoformat()}: "
+            "paper_market_ticks captured 0 packets. "
+            "Report shipped with a red banner. Fix paper_quote_feed before next session.",
+            file=sys.stderr,
+        )
     connection.execute(
         """
         INSERT INTO performance_reports(session_date, status, html_path, generated_at)

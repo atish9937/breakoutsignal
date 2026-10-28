@@ -101,9 +101,9 @@ class StrategyRunnerTests(unittest.TestCase):
         self.assertTrue(strategy_runner.report_due(at_deadline))
         self.assertTrue(strategy_runner.report_due(after_deadline))
 
-    def test_breakout_entry_cutoff_is_inclusive_for_the_1500_candle_cycle(self):
+    def test_breakout_entry_cutoff_is_inclusive_for_the_last_entry_candle(self):
         client = Mock()
-        now = dt.datetime(2026, 10, 19, 15, 0, 20, tzinfo=breakout.IST)
+        now = dt.datetime(2026, 10, 19, 14, 30, 20, tzinfo=breakout.IST)
         fired = {"breakout": set(), "trend_pullback": set()}
         with patch.object(breakout, "scan", return_value={}) as scan_breakout:
             with patch.object(trend_pullback, "scan") as scan_pullback:
@@ -153,6 +153,18 @@ class StrategyRunnerTests(unittest.TestCase):
 
         self.assertEqual(outputs, {"trend_pullback": result})
         scan_pullback.assert_called_once()
+
+    def test_cross_strategy_fired_set_is_shared_so_duplicates_are_skipped(self):
+        """Breakout and trend_pullback share one 'fired' set — once (symbol,side) is
+        in it, the other scanner's own add is a no-op (dedupe at the signal-fire step).
+        """
+        shared = {"KEY_ALREADY_FIRED"}
+        fired = {"breakout": shared, "trend_pullback": shared, "daily_hourly_15m": shared}
+        self.assertIs(fired["breakout"], fired["trend_pullback"])
+        self.assertIs(fired["trend_pullback"], fired["daily_hourly_15m"])
+        fired["breakout"].add("GRASIM_PE")
+        self.assertIn("GRASIM_PE", fired["trend_pullback"])
+        self.assertIn("GRASIM_PE", fired["daily_hourly_15m"])
 
 
 if __name__ == "__main__":

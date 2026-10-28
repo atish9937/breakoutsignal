@@ -326,6 +326,30 @@ class TradePerformanceTests(unittest.TestCase):
             )
         self.assertEqual(send.call_count, 1)
 
+    def test_report_shows_dead_quote_feed_banner_when_no_ticks(self):
+        """When trades were recorded but zero WS ticks reached the DB, flag it loudly."""
+        self.add_buy()
+        rows = performance._report_rows(self.connection, SESSION)
+        report = performance.render_html(
+            rows,
+            SESSION,
+            dt.datetime(2026, 10, 21, 15, 35, tzinfo=IST),
+            market_tick_count=0,
+        )
+        self.assertIn("Live quote feed DOWN", report)
+        self.assertIn("Zero WebSocket packets were captured", report)
+
+    def test_report_omits_dead_feed_banner_when_ticks_captured(self):
+        self.add_buy()
+        rows = performance._report_rows(self.connection, SESSION)
+        report = performance.render_html(
+            rows,
+            SESSION,
+            dt.datetime(2026, 10, 21, 15, 35, tzinfo=IST),
+            market_tick_count=1200,
+        )
+        self.assertNotIn("Live quote feed DOWN", report)
+
 
 if __name__ == "__main__":
     unittest.main()

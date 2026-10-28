@@ -17,6 +17,10 @@ MAX_HOLD_SESSIONS = 3
 MIN_EXPIRY_DAYS = 7
 MAX_OPTION_SPREAD_PCT = 5.0
 MAX_CHAIN_CANDIDATES = 3
+OPTION_MIN_PREMIUM = 2.0
+OPTION_MIN_OI = 1000
+OPTION_MIN_DELTA = 0.30
+OPTION_REQUIRE_BID = True
 PULLBACK_ATR_TOLERANCE = 0.5
 SWING_STOP_ATR_BUFFER = 0.15
 MIN_PULLBACK_VOLUME_RATIO = 1.0
@@ -220,13 +224,17 @@ def _option_candidates(
         premium = float(quote.get("last_price") or 0)
         spread_pct = (100 * (ask - bid) / ((ask + bid) / 2)
                       if bid > 0 and ask >= bid else None)
+        oi_value = int(float(quote.get("oi") or 0))
+        delta_raw = (quote.get("greeks") or {}).get("delta")
+        delta_abs = abs(float(delta_raw)) if delta_raw is not None else None
         lot, security_id = core.lot_and_id(master, symbol, expiry, strike, side)
         checks = {
-            "premium_positive": premium > 0,
-            "open_interest_positive": float(quote.get("oi") or 0) > 0,
+            "premium_above_min": premium >= OPTION_MIN_PREMIUM,
+            "open_interest_above_min": oi_value >= OPTION_MIN_OI,
             "volume_positive": float(quote.get("volume") or 0) > 0,
-            "bid_ask_available": spread_pct is not None,
+            "bid_available": not OPTION_REQUIRE_BID or bid > 0,
             "spread_within_limit": spread_pct is not None and spread_pct <= MAX_OPTION_SPREAD_PCT,
+            "delta_above_min": delta_abs is not None and delta_abs >= OPTION_MIN_DELTA,
             "security_id_available": bool(security_id),
             "lot_size_available": bool(lot),
         }
@@ -240,6 +248,7 @@ def _option_candidates(
             "spread_pct": round(spread_pct, 3) if spread_pct is not None else None,
             "open_interest": quote.get("oi"),
             "volume": quote.get("volume"),
+            "delta": round(delta_abs, 3) if delta_abs is not None else None,
             "lot_size": lot,
             "checks": checks,
             "passes": all(checks.values()),

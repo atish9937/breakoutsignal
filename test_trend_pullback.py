@@ -133,7 +133,9 @@ class TrendPullbackTests(unittest.TestCase):
         }
         with patch.object(core, "pick_option", return_value=option_info), \
                 patch.object(core, "lot_and_id", return_value=(50, 12345)):
-            result = strategy.attach_option_check(result, None, "2026-10-29", {})
+            result = strategy.attach_option_check(
+                result, None, "2026-10-29", {}, day=dt.date(2026, 10, 19)
+            )
 
         self.assertEqual(result["verdict"], "BUY_CE")
         self.assertEqual(result["option"]["security_id"], 12345)
@@ -155,7 +157,9 @@ class TrendPullbackTests(unittest.TestCase):
         }
         with patch.object(core, "pick_option", return_value=option_info), \
                 patch.object(core, "lot_and_id", return_value=(50, 12345)):
-            result = strategy.attach_option_check(result, None, "2026-10-29", {})
+            result = strategy.attach_option_check(
+                result, None, "2026-10-29", {}, day=dt.date(2026, 10, 19)
+            )
 
         self.assertEqual(result["verdict"], "WATCH_CE")
         self.assertIn("OI-wall runway", result["fails"])
@@ -176,10 +180,66 @@ class TrendPullbackTests(unittest.TestCase):
         }
         with patch.object(core, "pick_option", return_value=option_info), \
                 patch.object(core, "lot_and_id", return_value=(50, 12345)):
-            result = strategy.attach_option_check(result, None, "2026-10-29", {})
+            result = strategy.attach_option_check(
+                result, None, "2026-10-29", {}, day=dt.date(2026, 10, 19)
+            )
 
         self.assertEqual(result["verdict"], "WATCH_CE")
         self.assertIn("Option liquidity", result["fails"])
+
+    def _wrap_attach(self, opt_overrides, *, day=dt.date(2026, 10, 19),
+                     expiry="2026-10-29"):
+        result = self.evaluate()
+        base = {
+            "last_price": 10.0,
+            "top_bid_price": 9.9,
+            "top_ask_price": 10.1,
+            "oi": 2000,
+            "greeks": {"delta": 0.5},
+        }
+        base.update(opt_overrides or {})
+        option_info = {
+            "strike": 110.0, "wall": 112.0, "opposite_wall": 100.0, "opt": base,
+        }
+        with patch.object(core, "pick_option", return_value=option_info), \
+                patch.object(core, "lot_and_id", return_value=(50, 12345)):
+            return strategy.attach_option_check(result, None, expiry, {}, day=day)
+
+    def test_zero_dte_contract_fails_liquidity_gate(self):
+        result = self._wrap_attach({}, expiry="2026-10-19")
+        self.assertEqual(result["verdict"], "WATCH_CE")
+        liquidity = next(c for c in result["mechanical_checks"]
+                         if c["gate"] == "Option liquidity")
+        self.assertFalse(liquidity["passed"])
+        self.assertIn("DTE 0d", liquidity["current"])
+
+    def test_zero_bid_fails_liquidity_gate(self):
+        result = self._wrap_attach({"top_bid_price": 0.0})
+        liquidity = next(c for c in result["mechanical_checks"]
+                         if c["gate"] == "Option liquidity")
+        self.assertFalse(liquidity["passed"])
+        self.assertEqual(result["verdict"], "WATCH_CE")
+
+    def test_low_delta_fails_liquidity_gate(self):
+        result = self._wrap_attach({"greeks": {"delta": 0.15}})
+        liquidity = next(c for c in result["mechanical_checks"]
+                         if c["gate"] == "Option liquidity")
+        self.assertFalse(liquidity["passed"])
+        self.assertEqual(result["verdict"], "WATCH_CE")
+
+    def test_penny_premium_fails_liquidity_gate(self):
+        result = self._wrap_attach({"last_price": 0.5})
+        liquidity = next(c for c in result["mechanical_checks"]
+                         if c["gate"] == "Option liquidity")
+        self.assertFalse(liquidity["passed"])
+        self.assertEqual(result["verdict"], "WATCH_CE")
+
+    def test_low_oi_fails_liquidity_gate(self):
+        result = self._wrap_attach({"oi": 500})
+        liquidity = next(c for c in result["mechanical_checks"]
+                         if c["gate"] == "Option liquidity")
+        self.assertFalse(liquidity["passed"])
+        self.assertEqual(result["verdict"], "WATCH_CE")
 
 
 if __name__ == "__main__":

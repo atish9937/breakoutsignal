@@ -26,30 +26,54 @@ EXCHANGE_CODES = {
 }
 EXCHANGE_SEGMENTS = {value: key for key, value in EXCHANGE_CODES.items()}
 FULL_PACKET_CODE = 8
-FULL_PACKET_SIZE = 163
+FULL_PACKET_SIZE = 162
+DEPTH_LEVEL_OFFSET = 62
 SAMPLE_INTERVAL_SECONDS = 1.0
 
 
 def parse_full_packet(packet: bytes) -> dict | None:
-    """Decode Dhan's documented 163-byte little-endian Full Market Depth packet."""
+    """Decode Dhan v2's 162-byte little-endian Full packet (response code 8).
+
+    Byte layout (per DhanHQ v2 annexure):
+      0        uint8    feed response code
+      1-2      int16    message length
+      3        uint8    exchange segment
+      4-7      int32    security id
+      8-11     float32  last traded price
+     12-13     int16    last traded quantity
+     14-17     int32    last trade time (epoch)
+     18-21     float32  average trade price
+     22-25     int32    volume
+     26-29     int32    total sell qty
+     30-33     int32    total buy qty
+     34-37     int32    open interest
+     38-41     int32    highest oi (NSE_FNO)
+     42-45     int32    lowest oi  (NSE_FNO)
+     46-49     float32  day open
+     50-53     float32  day close
+     54-57     float32  day high
+     58-61     float32  day low
+     62-161    5 x 20   market depth (level 1-5)
+
+    Depth level (20 bytes): bid_qty(i4), ask_qty(i4), bid_orders(i2),
+    ask_orders(i2), bid_price(f4), ask_price(f4).
+    """
     if len(packet) < FULL_PACKET_SIZE:
         return None
-    response_code, _message_length, exchange_code, security_id = struct.unpack_from(
-        "<BHBi", packet, 0
-    )
+    response_code = packet[0]
     if response_code != FULL_PACKET_CODE:
         return None
+    exchange_code = packet[3]
     segment = EXCHANGE_CODES.get(exchange_code)
     if segment is None:
         return None
-    last_price = struct.unpack_from("<f", packet, 9)[0]
-    last_trade_epoch = struct.unpack_from("<i", packet, 15)[0]
-    volume, open_interest = struct.unpack_from("<ii", packet, 23)[0], struct.unpack_from(
-        "<i", packet, 35
-    )[0]
-    bid_quantity, ask_quantity, _bid_orders, _ask_orders, bid, ask = struct.unpack_from(
-        "<iihhff", packet, 63
-    )
+    security_id = struct.unpack_from("<i", packet, 4)[0]
+    last_price = struct.unpack_from("<f", packet, 8)[0]
+    last_trade_epoch = struct.unpack_from("<i", packet, 14)[0]
+    volume = struct.unpack_from("<i", packet, 22)[0]
+    open_interest = struct.unpack_from("<i", packet, 34)[0]
+    bid_quantity, ask_quantity = struct.unpack_from("<ii", packet, DEPTH_LEVEL_OFFSET)
+    bid, ask = struct.unpack_from("<ff", packet, DEPTH_LEVEL_OFFSET + 12)
     last_trade_at = (
         dt.datetime.fromtimestamp(last_trade_epoch, dt.timezone.utc).isoformat()
         if last_trade_epoch > 0

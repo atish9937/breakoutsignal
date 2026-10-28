@@ -18,6 +18,11 @@ FORCED_EXIT = dt.time(15, 15)
 MAX_SIGNALS_PER_DAY = 4
 MAX_OPTION_CANDIDATES = 12
 MAX_OPTION_SPREAD_PCT = 3.0
+OPTION_MIN_PREMIUM = 2.0
+OPTION_MIN_OI = 1000
+OPTION_MIN_DELTA = 0.30
+OPTION_MIN_DTE_DAYS = 5
+OPTION_REQUIRE_BID = True
 RISK_REWARD = 2.0
 PULLBACK_ATR = 0.35
 _hourly_cache: dict[tuple[str, int], tuple[pd.Timestamp, pd.DataFrame]] = {}
@@ -103,7 +108,8 @@ def _setup(symbol: str, side: str, candles: pd.DataFrame, now: dt.datetime) -> d
 
 
 def _select_option(chain: dict, side: str, spot: float, symbol: str,
-                   expiry: str, master: pd.DataFrame) -> dict | None:
+                   expiry: str, master: pd.DataFrame,
+                   day: dt.date | None = None) -> dict | None:
     leg_name = "ce" if side == "CE" else "pe"
     contracts = []
     for raw_strike, legs in (chain.get("oc") or {}).items():
@@ -123,19 +129,35 @@ def _select_option(chain: dict, side: str, spot: float, symbol: str,
         nearest_itm = min(itm_options, key=lambda row: row[0])
         if nearest_itm[2] != atm[2]:
             choices.append(("slightly_ITM", nearest_itm))
+    dte_days = None
+    if day is not None and expiry:
+        try:
+            dte_days = (dt.date.fromisoformat(expiry) - day).days
+        except (TypeError, ValueError):
+            dte_days = None
+    if dte_days is not None and dte_days < OPTION_MIN_DTE_DAYS:
+        return None
     eligible = []
     for label, (_, _, strike, quote) in choices:
         bid = float(quote.get("top_bid_price") or 0)
         ask = float(quote.get("top_ask_price") or 0)
         mid = (bid + ask) / 2 if bid > 0 and ask >= bid else 0
         spread = (100 * (ask - bid) / mid) if mid > 0 else None
+        premium = float(quote.get("last_price") or 0)
+        oi_value = int(float(quote.get("oi") or 0))
+        volume_value = float(quote.get("volume") or 0)
+        delta_raw = (quote.get("greeks") or {}).get("delta")
+        delta_abs = abs(float(delta_raw)) if delta_raw is not None else None
         lot, security_id = core.lot_and_id(master, symbol, expiry, strike, side)
         if not (
-            float(quote.get("last_price") or 0) > 0
-            and float(quote.get("oi") or 0) > 0
-            and float(quote.get("volume") or 0) > 0
+            premium >= OPTION_MIN_PREMIUM
+            and oi_value >= OPTION_MIN_OI
+            and volume_value > 0
+            and (not OPTION_REQUIRE_BID or bid > 0)
             and spread is not None
             and spread <= MAX_OPTION_SPREAD_PCT
+            and delta_abs is not None
+            and delta_abs >= OPTION_MIN_DELTA
             and lot and security_id
         ):
             continue
@@ -143,14 +165,16 @@ def _select_option(chain: dict, side: str, spot: float, symbol: str,
             "selection": label,
             "strike": strike,
             "security_id": security_id,
-            "premium": float(quote["last_price"]),
+            "premium": premium,
             "bid": bid,
             "ask": ask,
             "spread_pct": round(spread, 3),
             "oi": quote.get("oi"),
             "volume": quote.get("volume"),
+            "delta": round(delta_abs, 3),
+            "dte_days": dte_days,
             "lot_size": lot,
-            "cost_per_lot": round(float(quote["last_price"]) * lot, 2),
+            "cost_per_lot": round(premium * lot, 2),
         })
     return min(eligible, key=lambda row: (row["spread_pct"], -float(row["oi"]), -float(row["volume"])),
                default=None)
@@ -206,7 +230,7 @@ def scan(dh, master: pd.DataFrame, prep: dict, universe: dict[str, int],
         chain = dh.option_chain(universe[signal["symbol"]], expiry)
         option = _select_option(
             chain, signal["side"], signal["underlying_entry"],
-            signal["symbol"], expiry, master,
+            signal["symbol"], expiry, master, day=day,
         )
         if not option:
             continue

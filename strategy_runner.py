@@ -291,14 +291,20 @@ def main():
                 file=sys.stderr,
             )
             traceback.print_exc()
+    cross_fired: set[str] = set()
+    for signal_file in (
+        breakout.OUT / f"signals_{day}.jsonl",
+        breakout.OUT / f"trend_pullback_signals_{day}.jsonl",
+        breakout.OUT / f"daily_hourly_15m_signals_{day}.jsonl",
+    ):
+        cross_fired |= load_fired_signals(signal_file)
+    # Share one set across strategies: once any scanner has recommended
+    # (symbol, side) today, every other scanner skips the same contract. Prevents
+    # the same bet from being written twice to the paper ledger / signal files.
     fired = {
-        "breakout": load_fired_signals(breakout.OUT / f"signals_{day}.jsonl"),
-        "trend_pullback": load_fired_signals(
-            breakout.OUT / f"trend_pullback_signals_{day}.jsonl"
-        ),
-        "daily_hourly_15m": load_fired_signals(
-            breakout.OUT / f"daily_hourly_15m_signals_{day}.jsonl"
-        ),
+        "breakout": cross_fired,
+        "trend_pullback": cross_fired,
+        "daily_hourly_15m": cross_fired,
     }
 
     if args.once:

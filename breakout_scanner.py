@@ -180,10 +180,8 @@ from dotenv import dotenv_values, load_dotenv, set_key
 # --------------------------------------------------------------------------------------
 CONFIG = {
     "capital": 72000,            # your trading capital in Rs
-    "max_risk_pct": 2.0,         # max loss per trade as % of capital - reported via risk_warning
-    "block_over_risk": False,    # True = a mechanical safety cap: downgrade BUY to SKIP if
-                                  # one lot risks more than max_risk_pct. False (default) leaves
-                                  # sizing to you/AI - the recommendation still shows with risk_warning set.
+    "max_risk_pct": 2.0,         # max loss per trade as % of capital
+    "block_over_risk": True,     # hard veto: downgrade BUY to SKIP if one lot risks > max_risk_pct
     "atr_period": 14,            # daily ATR length
     "box_days": 5,               # box = high/low of the last N completed days
     "max_atr_used": 0.60,        # mechanical: skip if |price - open| > 60% of ATR (move already done)
@@ -198,11 +196,16 @@ CONFIG = {
     "min_recommend_score": 4,    # of 5 quality factors (catalyst/news is not counted - AI
                                   # validates that separately; see ai_validation on every BUY)
     "max_option_spread_pct": 3.0,  # mechanical: option must be liquid enough to actually fill
+    "option_min_premium": 2.0,     # reject penny / near-worthless strikes
+    "option_min_oi": 1000,         # reject tiny OI (illiquid)
+    "option_min_delta": 0.30,      # reject deep-OTM lottery tickets (require real directional exposure)
+    "option_min_dte_days": 5,      # calendar days-to-expiry; blocks 0-DTE / expiry-week gamma traps
+    "option_require_bid": True,    # bid must be > 0 - closes the "spread not available" bypass
     "entry_start": "09:30",
     "entry_cutoff": "12:30",
     "run_start": "09:20",
     "run_end": "12:35",
-    "extended_entry_cutoff": "15:00",
+    "extended_entry_cutoff": "14:30",  # tightened from 15:00 so entries have >=45 min to resolve
     "extended_run_end": "15:05",
     "max_candidates_per_scan": 15,  # option-chain calls are slow (1 per 3 s)
 }
@@ -900,16 +903,51 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
         prem = float(opt.get("last_price") or 0)
         bid, ask = float(opt.get("top_bid_price") or 0), float(opt.get("top_ask_price") or 0)
         spread = (ask - bid) / prem * 100 if prem and ask and bid else None
-        liquid_ok = prem > 0 and (opt.get("oi") or 0) > 0 and (spread is None or spread <= CONFIG["max_option_spread_pct"])
+        oi_value = int(opt.get("oi") or 0)
+        delta_raw = ((opt.get("greeks") or {}).get("delta"))
+        delta = abs(float(delta_raw)) if delta_raw is not None else None
+        dte_days = (dt.date.fromisoformat(prep["expiry"]) - day).days if prep.get("expiry") else None
+        reasons = []
+        if prem < CONFIG["option_min_premium"]:
+            reasons.append(f"premium {prem:.2f} < {CONFIG['option_min_premium']:.2f}")
+        if oi_value < CONFIG["option_min_oi"]:
+            reasons.append(f"OI {oi_value} < {CONFIG['option_min_oi']}")
+        if CONFIG["option_require_bid"] and bid <= 0:
+            reasons.append("bid unavailable (no live quote)")
+        if spread is not None and spread > CONFIG["max_option_spread_pct"]:
+            reasons.append(f"spread {spread:.2f}% > {CONFIG['max_option_spread_pct']:.2f}%")
+        if delta is None or delta < CONFIG["option_min_delta"]:
+            reasons.append(
+                f"delta {'missing' if delta is None else f'{delta:.2f}'} "
+                f"< {CONFIG['option_min_delta']:.2f}"
+            )
+        if dte_days is None or dte_days < CONFIG["option_min_dte_days"]:
+            reasons.append(
+                f"DTE {'missing' if dte_days is None else dte_days} "
+                f"< {CONFIG['option_min_dte_days']} days"
+            )
+        liquid_ok = not reasons
         spread_current = f"{spread:.2f}%" if spread is not None else "not available"
-        liquidity_current = (f"premium {prem:.2f}; OI {opt.get('oi') or 0}; spread {spread_current}")
-        record_check(
-            "Option liquidity", liquidity_current,
-            f"premium > 0; OI > 0; spread <= {CONFIG['max_option_spread_pct']:.2f}% when bid/ask available",
-            liquid_ok,
+        delta_current = f"{delta:.2f}" if delta is not None else "missing"
+        dte_current = f"{dte_days}d" if dte_days is not None else "missing"
+        liquidity_current = (
+            f"premium {prem:.2f}; OI {oi_value}; spread {spread_current}; "
+            f"delta {delta_current}; DTE {dte_current}"
         )
-        (passes if liquid_ok else fails).append(f"option liquidity (spread {spread if spread is None else round(spread,1)}%)")
-        delta = abs(float(((opt.get("greeks") or {}).get("delta")) or 0.5)) or 0.5
+        criterion_text = (
+            f"premium >= {CONFIG['option_min_premium']:.2f}; "
+            f"OI >= {CONFIG['option_min_oi']}; "
+            f"bid > 0; spread <= {CONFIG['max_option_spread_pct']:.2f}%; "
+            f"|delta| >= {CONFIG['option_min_delta']:.2f}; "
+            f"DTE >= {CONFIG['option_min_dte_days']} days"
+        )
+        record_check("Option liquidity", liquidity_current, criterion_text, liquid_ok)
+        if liquid_ok:
+            passes.append(f"option liquidity (spread {round(spread, 1) if spread is not None else 'n/a'}%)")
+        else:
+            fails.append("option liquidity: " + "; ".join(reasons))
+        if delta is None:
+            delta = 0.5
         lot, opt_sid = lot_and_id(master, sym, prep["expiry"], opt_info["strike"], side)
         loss_lot = delta * risk * lot if lot else None
         plan.update({"t1": r2(t1), "t2": r2(t2), "next_wall": wall, "opposite_wall": opt_info["opposite_wall"],

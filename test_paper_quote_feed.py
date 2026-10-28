@@ -11,13 +11,16 @@ from trade_performance import connect, record_buy_recommendations
 
 class PaperQuoteFeedTests(unittest.TestCase):
     def test_decodes_full_packet_ltp_best_depth_and_contract_identity(self):
-        packet = bytearray(163)
-        struct.pack_into("<BHBi", packet, 0, 8, 163, 2, 98765)
-        struct.pack_into("<f", packet, 9, 123.45)
-        struct.pack_into("<i", packet, 15, 1792670000)
-        struct.pack_into("<i", packet, 23, 54321)
-        struct.pack_into("<i", packet, 35, 112233)
-        struct.pack_into("<iihhff", packet, 63, 250, 300, 4, 5, 123.4, 123.5)
+        packet = bytearray(162)
+        packet[0] = 8
+        struct.pack_into("<H", packet, 1, 162)
+        packet[3] = 2
+        struct.pack_into("<i", packet, 4, 98765)
+        struct.pack_into("<f", packet, 8, 123.45)
+        struct.pack_into("<i", packet, 14, 1792670000)
+        struct.pack_into("<i", packet, 22, 54321)
+        struct.pack_into("<i", packet, 34, 112233)
+        struct.pack_into("<iihhff", packet, 62, 250, 300, 4, 5, 123.4, 123.5)
 
         quote = parse_full_packet(bytes(packet))
 
@@ -34,8 +37,10 @@ class PaperQuoteFeedTests(unittest.TestCase):
 
     def test_ignores_unrecognized_or_short_packets(self):
         self.assertIsNone(parse_full_packet(b"\x08"))
-        packet = bytearray(163)
-        struct.pack_into("<BHBi", packet, 0, 2, 163, 2, 98765)
+        packet = bytearray(162)
+        packet[0] = 2
+        packet[3] = 2
+        struct.pack_into("<i", packet, 4, 98765)
         self.assertIsNone(parse_full_packet(bytes(packet)))
 
     def test_quote_samples_are_scoped_to_the_recorder_session(self):
@@ -48,8 +53,11 @@ class PaperQuoteFeedTests(unittest.TestCase):
                     "token",
                     dt.date(2026, 10, 22),
                 )
-                packet = bytearray(163)
-                struct.pack_into("<BHBi", packet, 0, 8, 163, 2, 98765)
+                packet = bytearray(162)
+                packet[0] = 8
+                struct.pack_into("<H", packet, 1, 162)
+                packet[3] = 2
+                struct.pack_into("<i", packet, 4, 98765)
                 recorder._save_packet(connection, bytes(packet))
                 row = connection.execute(
                     "SELECT session_date, instrument_segment, security_id FROM paper_market_ticks"

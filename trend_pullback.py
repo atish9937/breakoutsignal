@@ -32,7 +32,13 @@ MAX_EXTENSION_ATR = 0.5
 MIN_VOLUME_RATIO = 0.8
 MIN_RUNWAY_R = 1.0
 MAX_OPTION_SPREAD_PCT = 5.0
+OPTION_MIN_PREMIUM = 2.0
+OPTION_MIN_OI = 1000
+OPTION_MIN_DELTA = 0.30
+OPTION_MIN_DTE_DAYS = 5
+OPTION_REQUIRE_BID = True
 OPTION_DELTA_FALLBACK = 0.5
+MAX_SIGNALS_PER_CYCLE = 3
 OUT = core.OUT
 
 
@@ -185,7 +191,7 @@ def evaluate_setup(symbol, candles, now, nifty_bias):
     return result
 
 
-def attach_option_check(result, master, expiry, chain):
+def attach_option_check(result, master, expiry, chain, day=None):
     """Add ATM contract, OI-runway, and spread/liquidity gates to a valid setup."""
     side = result["side"]
     ltp = float(result["ltp"])
@@ -211,18 +217,51 @@ def attach_option_check(result, master, expiry, chain):
     bid = float(option.get("top_bid_price") or 0)
     ask = float(option.get("top_ask_price") or 0)
     spread = (ask - bid) / premium * 100 if premium > 0 and ask > 0 and bid > 0 else None
-    spread_ok = spread is None or 0 <= spread <= MAX_OPTION_SPREAD_PCT
-    liquid = premium > 0 and (option.get("oi") or 0) > 0 and spread_ok
-    record_check(checks, "Option liquidity",
-                 f"premium {premium:.2f}; OI {option.get('oi') or 0}; "
-                 f"spread {f'{spread:.2f}%' if spread is not None else 'unavailable'}",
-                 f"premium and OI > 0; spread <= {MAX_OPTION_SPREAD_PCT:.1f}% when quoted",
-                 liquid)
+    oi_value = int(option.get("oi") or 0)
+    delta_raw = (option.get("greeks") or {}).get("delta")
+    delta_abs = abs(float(delta_raw)) if delta_raw is not None else None
+    dte_days = None
+    if day is not None and expiry:
+        try:
+            dte_days = (dt.date.fromisoformat(expiry) - day).days
+        except (TypeError, ValueError):
+            dte_days = None
+    reasons = []
+    if premium < OPTION_MIN_PREMIUM:
+        reasons.append(f"premium {premium:.2f} < {OPTION_MIN_PREMIUM:.2f}")
+    if oi_value < OPTION_MIN_OI:
+        reasons.append(f"OI {oi_value} < {OPTION_MIN_OI}")
+    if OPTION_REQUIRE_BID and bid <= 0:
+        reasons.append("bid unavailable (no live quote)")
+    if spread is not None and spread > MAX_OPTION_SPREAD_PCT:
+        reasons.append(f"spread {spread:.2f}% > {MAX_OPTION_SPREAD_PCT:.1f}%")
+    if delta_abs is None or delta_abs < OPTION_MIN_DELTA:
+        reasons.append(
+            f"delta {'missing' if delta_abs is None else f'{delta_abs:.2f}'} "
+            f"< {OPTION_MIN_DELTA:.2f}"
+        )
+    if dte_days is None or dte_days < OPTION_MIN_DTE_DAYS:
+        reasons.append(
+            f"DTE {'missing' if dte_days is None else dte_days} "
+            f"< {OPTION_MIN_DTE_DAYS} days"
+        )
+    liquid = not reasons
+    record_check(
+        checks, "Option liquidity",
+        f"premium {premium:.2f}; OI {oi_value}; "
+        f"spread {f'{spread:.2f}%' if spread is not None else 'unavailable'}; "
+        f"delta {f'{delta_abs:.2f}' if delta_abs is not None else 'missing'}; "
+        f"DTE {f'{dte_days}d' if dte_days is not None else 'missing'}",
+        f"premium >= {OPTION_MIN_PREMIUM:.2f}; OI >= {OPTION_MIN_OI}; "
+        f"bid > 0; spread <= {MAX_OPTION_SPREAD_PCT:.1f}%; "
+        f"|delta| >= {OPTION_MIN_DELTA:.2f}; DTE >= {OPTION_MIN_DTE_DAYS}d",
+        liquid,
+    )
 
     lot, option_sid = core.lot_and_id(
         master, result["symbol"], expiry, option_info["strike"], side
     )
-    delta = abs(float((option.get("greeks") or {}).get("delta") or OPTION_DELTA_FALLBACK))
+    delta = delta_abs if delta_abs is not None else OPTION_DELTA_FALLBACK
     cost = premium * lot if lot else None
     capital_ok = cost is not None and cost <= core.CONFIG["capital"]
     record_check(checks, "One-lot premium budget",
@@ -298,7 +337,7 @@ def scan(dh, master, universe, exclude, expiry, day, now, fired):
                     result["verdict"] = f"WATCH_{result['side']}"
                 else:
                     chain = dh.option_chain(sid, expiry)
-                    result = attach_option_check(result, master, expiry, chain)
+                    result = attach_option_check(result, master, expiry, chain, day=day)
             results.append(result)
         except core.DhanAuthError:
             raise
@@ -327,6 +366,20 @@ def scan(dh, master, universe, exclude, expiry, day, now, fired):
             stream.write(json.dumps({"nifty_bias": nifty["bias"], **result}) + "\n")
 
     buys = [result for result in results if result["verdict"].startswith("BUY_")]
+    buys.sort(
+        key=lambda r: (
+            float(((r.get("plan") or {}).get("runway_r")) or 0),
+            float(r.get("volume_ratio") or 0),
+        ),
+        reverse=True,
+    )
+    if len(buys) > MAX_SIGNALS_PER_CYCLE:
+        for result in buys[MAX_SIGNALS_PER_CYCLE:]:
+            result["verdict"] = f"WATCH_{result['side']}"
+            result["fails"].append(
+                f"exceeds MAX_SIGNALS_PER_CYCLE={MAX_SIGNALS_PER_CYCLE} this cycle"
+            )
+        buys = buys[:MAX_SIGNALS_PER_CYCLE]
     signal_path = OUT / f"trend_pullback_signals_{day}.jsonl"
     for result in buys:
         key = f"{result['symbol']}_{result['side']}"

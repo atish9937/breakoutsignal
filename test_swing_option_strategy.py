@@ -60,9 +60,11 @@ class SwingOptionStrategyTests(unittest.TestCase):
         chain = {
             "oc": {
                 "100": {"ce": {"last_price": 12, "top_bid_price": 11.95,
-                               "top_ask_price": 12.05, "oi": 1000, "volume": 100}},
+                               "top_ask_price": 12.05, "oi": 2000, "volume": 100,
+                               "greeks": {"delta": 0.6}}},
                 "105": {"ce": {"last_price": 10, "top_bid_price": 9.9,
-                               "top_ask_price": 10.1, "oi": 800, "volume": 80}},
+                               "top_ask_price": 10.1, "oi": 1500, "volume": 80,
+                               "greeks": {"delta": 0.5}}},
             }
         }
         master = pd.DataFrame()
