@@ -41,7 +41,9 @@ class TrendPullbackTests(unittest.TestCase):
                 patch.object(core, "atr", return_value=2.0), \
                 patch.object(core, "vwap", return_value=103.0), \
                 patch.object(core, "rsi", return_value=60.0), \
-                patch.object(core, "macd_hist", return_value=0.2):
+                patch.object(core, "macd_hist", return_value=0.2), \
+                patch.object(core, "adx", return_value=25.0), \
+                patch.object(core, "momentum_divergence", return_value=None):
             result = strategy.evaluate_setup(
                 "TEST", candles, now, {"bias": bias}
             )
@@ -81,7 +83,9 @@ class TrendPullbackTests(unittest.TestCase):
                 patch.object(core, "atr", return_value=2.0), \
                 patch.object(core, "vwap", return_value=97.0), \
                 patch.object(core, "rsi", return_value=40.0), \
-                patch.object(core, "macd_hist", return_value=-0.2):
+                patch.object(core, "macd_hist", return_value=-0.2), \
+                patch.object(core, "adx", return_value=25.0), \
+                patch.object(core, "momentum_divergence", return_value=None):
             result = strategy.evaluate_setup("TEST", candles, now, {"bias": "DOWN"})
 
         self.assertEqual(result["side"], "PE")
@@ -240,6 +244,73 @@ class TrendPullbackTests(unittest.TestCase):
                          if c["gate"] == "Option liquidity")
         self.assertFalse(liquidity["passed"])
         self.assertEqual(result["verdict"], "WATCH_CE")
+
+    def _evaluate_with_overrides(self, *, adx_value=25.0, divergence=None,
+                                 daily_ctx=None, breadth=None, vix=None,
+                                 bias="UP"):
+        candles = self.make_candles()
+
+        def fake_ema(values, span):
+            level = {9: 107.5, 21: 105.0, 50: 100.0}[span]
+            return pd.Series(level, index=values.index)
+
+        now = dt.datetime(2026, 10, 19, 10, 25, tzinfo=core.IST)
+        with patch.object(core, "ema", side_effect=fake_ema), \
+                patch.object(core, "atr", return_value=2.0), \
+                patch.object(core, "vwap", return_value=103.0), \
+                patch.object(core, "rsi", return_value=60.0), \
+                patch.object(core, "macd_hist", return_value=0.2), \
+                patch.object(core, "adx", return_value=adx_value), \
+                patch.object(core, "momentum_divergence", return_value=divergence):
+            return strategy.evaluate_setup(
+                "TEST", candles, now, {"bias": bias},
+                daily_ctx=daily_ctx, breadth=breadth, vix=vix,
+            )
+
+    def test_low_adx_vetoes_setup(self):
+        result = self._evaluate_with_overrides(adx_value=12.0)
+        adx_check = next(c for c in result["mechanical_checks"] if c["gate"] == "ADX trend strength")
+        self.assertFalse(adx_check["passed"])
+        self.assertEqual(result["verdict"], "WATCH_CE")
+
+    def test_bearish_divergence_vetoes_ce(self):
+        result = self._evaluate_with_overrides(
+            divergence="bearish RSI divergence: price HH but RSI LH"
+        )
+        div_check = next(c for c in result["mechanical_checks"] if c["gate"] == "Momentum divergence")
+        self.assertFalse(div_check["passed"])
+        self.assertEqual(result["verdict"], "WATCH_CE")
+
+    def test_breadth_below_threshold_vetoes_ce(self):
+        result = self._evaluate_with_overrides(
+            breadth={"pct_above_prev_close": 40.0}
+        )
+        breadth_check = next(c for c in result["mechanical_checks"] if c["gate"] == "Market breadth")
+        self.assertFalse(breadth_check["passed"])
+        self.assertEqual(result["verdict"], "WATCH_CE")
+
+    def test_vix_spike_vetoes_entry(self):
+        result = self._evaluate_with_overrides(
+            vix={"ltp": 28.0, "ema20": 15.0}  # 1.87x spike
+        )
+        vix_check = next(c for c in result["mechanical_checks"] if c["gate"] == "India VIX regime")
+        self.assertFalse(vix_check["passed"])
+        self.assertEqual(result["verdict"], "WATCH_CE")
+
+    def test_daily_trend_wrong_direction_vetoes_ce(self):
+        # Daily EMA20 slope negative -> CE should be vetoed
+        slope_series = pd.Series([105, 104, 103, 102, 101, 100], dtype=float)
+        result = self._evaluate_with_overrides(
+            daily_ctx={"ema20_series": slope_series}
+        )
+        daily_check = next(c for c in result["mechanical_checks"] if c["gate"] == "Daily trend")
+        self.assertFalse(daily_check["passed"])
+        self.assertEqual(result["verdict"], "WATCH_CE")
+
+    def test_missing_breadth_or_vix_does_not_block_setup(self):
+        """Graceful degradation: when external context is unavailable the gate becomes a no-op."""
+        result = self._evaluate_with_overrides(breadth=None, vix=None, daily_ctx=None)
+        self.assertEqual(result["verdict"], "SETUP_CE")
 
 
 if __name__ == "__main__":

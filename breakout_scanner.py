@@ -201,6 +201,13 @@ CONFIG = {
     "option_min_delta": 0.30,      # reject deep-OTM lottery tickets (require real directional exposure)
     "option_min_dte_days": 5,      # calendar days-to-expiry; blocks 0-DTE / expiry-week gamma traps
     "option_require_bid": True,    # bid must be > 0 - closes the "spread not available" bypass
+    "min_adx": 20.0,               # 5-min ADX14 - require a trending market, reject chop
+    "require_prior_day_level": True,  # CE: trigger must be at or beyond prior-day high. PE: at or beyond prior-day low
+    "require_vwap_alignment": True,   # hard gate: price must be within max_vwap_dist_pct of VWAP in trade direction
+    "veto_momentum_divergence": True, # bearish RSI divergence vetoes CE; bullish vetoes PE
+    "breadth_min_pct_for_ce": 55.0,   # at least 55% of universe trading above its own VWAP for CE
+    "breadth_max_pct_for_pe": 45.0,   # at most 45% of universe above its VWAP for PE (i.e. >=55% below VWAP)
+    "vix_spike_multiplier": 1.30,     # veto new entries when India VIX > 1.30 * its own 20-day EMA
     "entry_start": "09:30",
     "entry_cutoff": "12:30",
     "run_start": "09:20",
@@ -246,6 +253,7 @@ WATCHLIST = {
 LOT_FALLBACK = {"JSWSTEEL": 675, "SHRIRAMFIN": 825, "VEDL": 1150, "HDFCBANK": 550}
 
 NIFTY_ID = 13  # IDX_I
+INDIA_VIX_ID = 21  # IDX_I - override via env if Dhan changes the id
 API = "https://api.dhan.co/v2"
 SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
@@ -411,6 +419,101 @@ def atr(d: pd.DataFrame, n: int = 14) -> float:
     pc = d["close"].shift()
     tr = pd.concat([d["high"] - d["low"], (d["high"] - pc).abs(), (d["low"] - pc).abs()], axis=1).max(axis=1)
     return float(tr.ewm(alpha=1 / n, adjust=False).mean().iloc[-1])
+
+
+def adx(d: pd.DataFrame, n: int = 14) -> float | None:
+    """Wilder's Average Directional Index. Returns None when history is short."""
+    if len(d) < n + 1:
+        return None
+    high = d["high"].astype(float)
+    low = d["low"].astype(float)
+    close = d["close"].astype(float)
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = ((up_move > down_move) & (up_move > 0)).astype(float) * up_move.clip(lower=0)
+    minus_dm = ((down_move > up_move) & (down_move > 0)).astype(float) * down_move.clip(lower=0)
+    tr = pd.concat(
+        [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()],
+        axis=1,
+    ).max(axis=1)
+    alpha = 1 / n
+    smoothed_tr = tr.ewm(alpha=alpha, adjust=False).mean()
+    denom = smoothed_tr.replace(0, pd.NA)
+    plus_di = (100 * plus_dm.ewm(alpha=alpha, adjust=False).mean() / denom).astype(float).fillna(0.0)
+    minus_di = (100 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / denom).astype(float).fillna(0.0)
+    di_sum = (plus_di + minus_di).replace(0, float("nan"))
+    dx = (100 * (plus_di - minus_di).abs() / di_sum).fillna(0.0)
+    adx_value = dx.ewm(alpha=alpha, adjust=False).mean().iloc[-1]
+    if adx_value is None or (isinstance(adx_value, float) and math.isnan(adx_value)):
+        return None
+    return float(adx_value)
+
+
+def rsi_series(s: pd.Series, n: int = 14) -> pd.Series:
+    """Full RSI series (used for divergence detection)."""
+    series = s.astype(float)
+    delta = series.diff()
+    up = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    dn = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    rs = (up / dn.replace(0, float("nan"))).astype(float)
+    return (100 - 100 / (1 + rs)).astype(float)
+
+
+def momentum_divergence(candles: pd.DataFrame, side: str, lookback: int = 10) -> str | None:
+    """Detect bearish divergence for CE (price HH, RSI LH) or bullish for PE (price LL, RSI HL).
+
+    Returns a human-readable reason string if divergence is present, else None.
+    RSI is computed on the full candle history so the lookback window always has
+    RSI values; otherwise an early high/low with no RSI warm-up silently escapes.
+    """
+    if len(candles) < lookback + 3:
+        return None
+    rsi_full = rsi_series(candles["close"]).dropna()
+    if len(rsi_full) < lookback + 1:
+        return None
+    recent = candles.iloc[-lookback - 1 :]
+    recent = recent.loc[recent.index.isin(rsi_full.index)]
+    if len(recent) < 4:
+        return None
+    if side == "CE":
+        highs = recent["high"]
+        last_idx = highs.idxmax()
+        prior = highs.loc[: last_idx].iloc[:-1]
+        if prior.empty:
+            return None
+        prior_idx = prior.idxmax()
+        if highs.loc[last_idx] <= highs.loc[prior_idx]:
+            return None  # not a higher high -> not a bearish divergence setup
+        rsi_last = rsi_full.get(last_idx)
+        rsi_prior = rsi_full.get(prior_idx)
+        if rsi_last is None or rsi_prior is None:
+            return None
+        if rsi_last < rsi_prior - 2:
+            return (
+                f"bearish RSI divergence: price HH "
+                f"({highs.loc[prior_idx]:.2f}->{highs.loc[last_idx]:.2f}) "
+                f"but RSI LH ({rsi_prior:.1f}->{rsi_last:.1f})"
+            )
+        return None
+    lows = recent["low"]
+    last_idx = lows.idxmin()
+    prior = lows.loc[: last_idx].iloc[:-1]
+    if prior.empty:
+        return None
+    prior_idx = prior.idxmin()
+    if lows.loc[last_idx] >= lows.loc[prior_idx]:
+        return None  # not a lower low -> not a bullish divergence setup
+    rsi_last = rsi_full.get(last_idx)
+    rsi_prior = rsi_full.get(prior_idx)
+    if rsi_last is None or rsi_prior is None:
+        return None
+    if rsi_last > rsi_prior + 2:
+        return (
+            f"bullish RSI divergence: price LL "
+            f"({lows.loc[prior_idx]:.2f}->{lows.loc[last_idx]:.2f}) "
+            f"but RSI HL ({rsi_prior:.1f}->{rsi_last:.1f})"
+        )
+    return None
 
 
 def vwap(d: pd.DataFrame) -> float:
@@ -671,7 +774,20 @@ def prepare(dh: Dhan, day: dt.date, symbols: dict) -> dict:
                 raise
             except Exception:  # noqa: BLE001
                 pass
-    prep = {"date": str(day), "expiry": expiry, "stocks": stocks}
+    vix_baseline = old.get("vix") or {}
+    if "ema20" not in vix_baseline:
+        try:
+            vix_daily = dh.daily(INDIA_VIX_ID, seg="IDX_I", inst="INDEX", days=40)
+            if vix_daily is not None and not vix_daily.empty:
+                vix_baseline = {
+                    "ema20": round(float(ema(vix_daily["close"], 20).iloc[-1]), 2)
+                }
+        except DhanAuthError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            print(f"  (India VIX baseline unavailable: {e}; VIX gate will be skipped)")
+            vix_baseline = {}
+    prep = {"date": str(day), "expiry": expiry, "stocks": stocks, "vix": vix_baseline}
     OUT.mkdir(exist_ok=True)
     path.write_text(json.dumps(prep))
     print(f"  done: {len(stocks)} stocks, nearest expiry {expiry}")
@@ -755,7 +871,7 @@ def _live_price_beyond_trigger(side: str, price: float, trigger: float) -> bool:
 
 
 def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
-             ignore_entry_cutoff=False):
+             ignore_entry_cutoff=False, breadth=None, vix=None):
     p = prep["stocks"][sym]
     ohlc = q.get("ohlc") or {}
     ltp, o = float(q.get("last_price") or 0), float(ohlc.get("open") or 0)
@@ -859,12 +975,114 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
                  if ignore_entry_cutoff else f"time {t}")
     (passes if time_ok else fails).append(time_note)
 
-    # INFORMATIONAL from here - reported for AI/you to weigh, never gates the verdict.
+    # VWAP alignment is now a HARD gate (promoted from quality score in Commit B).
     vdist = sign * (ltp - vw) / vw * 100
     vwap_ok = 0 <= vdist <= CONFIG["max_vwap_dist_pct"]
+    if CONFIG.get("require_vwap_alignment", True):
+        vwap_passed = record_check(
+            "VWAP alignment",
+            f"{vdist:+.2f}% from VWAP",
+            f"0 <= distance <= {CONFIG['max_vwap_dist_pct']:.2f}% in trade direction",
+            vwap_ok,
+        )
+        (passes if vwap_passed else fails).append(
+            f"vwap {'aligned' if vwap_passed else 'misaligned'} ({vdist:+.2f}%)"
+        )
     nifty_ok = (side == "CE" and nifty["bias"] != "DOWN") or (side == "PE" and nifty["bias"] != "UP")
     res["vwap_note"] = f"{vdist:+.2f}% from VWAP ({'within' if vwap_ok else 'outside'} {CONFIG['max_vwap_dist_pct']}% band)"
     res["nifty_note"] = f"Nifty bias {nifty['bias']}, trade is {'aligned' if nifty_ok else 'against it'}"
+
+    # Prior-day H/L alignment - a true breakout trades beyond the prior session's extreme.
+    prev_level = p.get("prev_high") if side == "CE" else p.get("prev_low")
+    if CONFIG.get("require_prior_day_level", True) and prev_level is not None:
+        prior_ok = (ltp >= prev_level) if side == "CE" else (ltp <= prev_level)
+        record_check(
+            "Prior-day H/L alignment",
+            f"LTP {ltp:.2f} vs prev-day {'high' if side == 'CE' else 'low'} {prev_level:.2f}",
+            f"LTP must be {'at/above prev-day high' if side == 'CE' else 'at/below prev-day low'}",
+            prior_ok,
+        )
+        (passes if prior_ok else fails).append(
+            f"prior-day {'high' if side == 'CE' else 'low'} {'cleared' if prior_ok else 'not cleared'}"
+        )
+    else:
+        prior_ok = True
+
+    # ADX trend-strength - mechanical scanners wash out in chop; require ADX >= min_adx.
+    adx_value = adx(c)
+    adx_ok = adx_value is not None and adx_value >= CONFIG["min_adx"]
+    record_check(
+        "ADX trend strength",
+        f"ADX14 {'n/a' if adx_value is None else f'{adx_value:.1f}'}",
+        f">= {CONFIG['min_adx']:.1f}",
+        adx_ok,
+    )
+    (passes if adx_ok else fails).append(
+        f"ADX {'n/a' if adx_value is None else f'{adx_value:.1f}'}"
+    )
+    res["adx14_5m"] = r2(adx_value)
+
+    # RSI momentum-divergence veto - exhaustion signals are the opposite of a fresh breakout.
+    divergence = momentum_divergence(c, side) if CONFIG.get("veto_momentum_divergence", True) else None
+    divergence_ok = divergence is None
+    record_check(
+        "Momentum divergence",
+        divergence or "no divergence detected",
+        "no bearish RSI divergence for CE / no bullish RSI divergence for PE",
+        divergence_ok,
+    )
+    if not divergence_ok:
+        fails.append(f"divergence: {divergence}")
+    else:
+        passes.append("no RSI divergence")
+
+    # Market-breadth filter - directional bets need internals to agree.
+    breadth_pct = (breadth or {}).get("pct_above_prev_close")
+    if breadth_pct is None:
+        breadth_ok = True
+        breadth_current = "breadth n/a"
+    elif side == "CE":
+        breadth_ok = breadth_pct >= CONFIG["breadth_min_pct_for_ce"]
+        breadth_current = (
+            f"{breadth_pct:.1f}% of universe above prev-close "
+            f"(need >= {CONFIG['breadth_min_pct_for_ce']:.0f}% for CE)"
+        )
+    else:
+        breadth_ok = breadth_pct <= CONFIG["breadth_max_pct_for_pe"]
+        breadth_current = (
+            f"{breadth_pct:.1f}% of universe above prev-close "
+            f"(need <= {CONFIG['breadth_max_pct_for_pe']:.0f}% for PE)"
+        )
+    record_check(
+        "Market breadth",
+        breadth_current,
+        "breadth aligned with trade direction",
+        breadth_ok,
+    )
+    (passes if breadth_ok else fails).append(breadth_current)
+    res["breadth_pct"] = r2(breadth_pct) if breadth_pct is not None else None
+
+    # India VIX regime - veto new entries when vol is spiking (premiums bloated, chop risk).
+    vix_ltp = (vix or {}).get("ltp")
+    vix_baseline = (vix or {}).get("ema20")
+    if vix_ltp is None or vix_baseline is None or vix_baseline <= 0:
+        vix_ok = True
+        vix_current = "VIX regime n/a"
+    else:
+        multiplier = vix_ltp / vix_baseline
+        vix_ok = multiplier <= CONFIG["vix_spike_multiplier"]
+        vix_current = (
+            f"VIX {vix_ltp:.2f} vs 20d-EMA {vix_baseline:.2f} "
+            f"({multiplier:.2f}x; cap {CONFIG['vix_spike_multiplier']:.2f}x)"
+        )
+    record_check(
+        "India VIX regime",
+        vix_current,
+        f"VIX / 20d-EMA <= {CONFIG['vix_spike_multiplier']:.2f}",
+        vix_ok,
+    )
+    (passes if vix_ok else fails).append(vix_current)
+    res["vix"] = {"ltp": r2(vix_ltp), "ema20": r2(vix_baseline)} if vix_ltp is not None else None
 
     # 4. trade plan on the underlying
     entry = max(ltp, level) if side == "CE" else min(ltp, level)
@@ -1000,6 +1218,12 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
         "within entry window": time_ok,
         "runway to next OI wall": runway_ok,
         "option tradeable/liquid": liquid_ok,
+        "ADX trend strength": adx_ok,
+        "prior-day level cleared": prior_ok,
+        "VWAP aligned": (vwap_ok if CONFIG.get("require_vwap_alignment", True) else True),
+        "no RSI divergence": divergence_ok,
+        "market breadth aligned": breadth_ok,
+        "India VIX regime": vix_ok,
     }
     mechanical_ok = all(mechanical_gates.values())
     if mechanical_ok and quality_true >= CONFIG["min_recommend_score"]:
@@ -1056,6 +1280,50 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
 # --------------------------------------------------------------------------------------
 # One scan
 # --------------------------------------------------------------------------------------
+def _compute_breadth(prep: dict, quotes: dict, symbols: list[str]) -> dict:
+    """Fraction of the scanned universe trading above its prior close - a simple internals proxy."""
+    eq_quotes = (quotes or {}).get("NSE_EQ") or {}
+    total = above = 0
+    for symbol in symbols:
+        stock = prep["stocks"].get(symbol) or {}
+        quote = eq_quotes.get(str(stock.get("sid")))
+        if not quote:
+            continue
+        ltp = quote.get("last_price")
+        prev_close = stock.get("prev_close")
+        if ltp is None or prev_close is None or prev_close <= 0:
+            continue
+        total += 1
+        if float(ltp) > float(prev_close):
+            above += 1
+    if total == 0:
+        return {"pct_above_prev_close": None, "sample": 0}
+    return {"pct_above_prev_close": round(100 * above / total, 2), "sample": total}
+
+
+def _fetch_vix(dh, day, baseline_cache: dict | None = None) -> dict:
+    """Best-effort India VIX fetch: today's LTP + 20-day EMA baseline from daily history.
+
+    Any failure returns an empty dict so the VIX gate becomes a no-op rather than
+    blowing up the whole scan.
+    """
+    try:
+        quote = dh.ohlc({"IDX_I": [INDIA_VIX_ID]})
+        vix_quote = (quote.get("IDX_I") or {}).get(str(INDIA_VIX_ID), {})
+        ltp = vix_quote.get("last_price")
+    except Exception:  # noqa: BLE001
+        return {}
+    baseline = (baseline_cache or {}).get("ema20")
+    if baseline is None:
+        try:
+            vix_daily = dh.daily(INDIA_VIX_ID, seg="IDX_I", inst="INDEX", days=40)
+            if vix_daily is not None and not vix_daily.empty:
+                baseline = round(float(ema(vix_daily["close"], 20).iloc[-1]), 2)
+        except Exception:  # noqa: BLE001
+            baseline = None
+    return {"ltp": float(ltp) if ltp is not None else None, "ema20": baseline}
+
+
 def scan(dh, master, prep, day, exclude, fired, universe=None, ignore_entry_cutoff=False,
          live_orders_enabled=False, now=None):
     now = now or dt.datetime.now(IST)
@@ -1063,6 +1331,8 @@ def scan(dh, master, prep, day, exclude, fired, universe=None, ignore_entry_cuto
     quotes = dh.ohlc({"NSE_EQ": [prep["stocks"][s]["sid"] for s in syms], "IDX_I": [NIFTY_ID]})
     eq = quotes.get("NSE_EQ") or {}
     nifty = nifty_bias(dh, quotes, day, now)
+    breadth = _compute_breadth(prep, quotes, syms)
+    vix = _fetch_vix(dh, day, prep.get("vix"))
 
     # cheap pre-filter on quotes: near a box edge and not already stretched
     pre = []
@@ -1090,7 +1360,8 @@ def scan(dh, master, prep, day, exclude, fired, universe=None, ignore_entry_cuto
     for _, s, side, q in pre:
         try:
             results.append(evaluate(dh, master, prep, s, side, q, nifty, now, day,
-                                   ignore_entry_cutoff=ignore_entry_cutoff))
+                                   ignore_entry_cutoff=ignore_entry_cutoff,
+                                   breadth=breadth, vix=vix))
         except DhanAuthError:
             raise
         except Exception as e:  # noqa: BLE001

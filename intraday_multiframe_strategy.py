@@ -23,6 +23,10 @@ OPTION_MIN_OI = 1000
 OPTION_MIN_DELTA = 0.30
 OPTION_MIN_DTE_DAYS = 5
 OPTION_REQUIRE_BID = True
+# Exit the option if its live mid-price has dropped below PREMIUM_STOP_FRAC of the
+# entry mid. Caps the gamma / vega bleed when the underlying wanders without hitting
+# the stop level. Independent of the underlying-stop and underlying-target rules.
+PREMIUM_STOP_FRAC = 0.60
 RISK_REWARD = 2.0
 PULLBACK_ATR = 0.35
 _hourly_cache: dict[tuple[str, int], tuple[pd.Timestamp, pd.DataFrame]] = {}
@@ -338,26 +342,9 @@ def monitor_positions(dh, day: dt.date, now: dt.datetime) -> list[dict]:
         reason = None
         exit_price = None
         exit_time = None
-        for timestamp, candle in future.iterrows():
-            high, low = float(candle["high"]), float(candle["low"])
-            stop_hit = low <= stop if sign > 0 else high >= stop
-            target_hit = high >= target if sign > 0 else low <= target
-            if stop_hit:
-                reason = "underlying stop"
-                exit_price = min(stop, float(candle["open"])) if sign > 0 else max(stop, float(candle["open"]))
-            elif target_hit:
-                reason = "underlying 2R target"
-                exit_price = target
-            if reason:
-                exit_time = timestamp
-                break
-        if reason is None and current.time() >= FORCED_EXIT:
-            reason = "mandatory same-day exit"
-            exit_time = future.index[-1]
-            exit_price = float(future.iloc[-1]["close"])
-        if reason is None:
-            continue
 
+        # Premium-side stop takes precedence - caps the loss size for the whole
+        # strategy. Fetch the current option quote once per monitor pass.
         option_quote = None
         try:
             chain = dh.option_chain(security_id, signal["expiry"])
@@ -368,10 +355,41 @@ def monitor_positions(dh, day: dt.date, now: dt.datetime) -> list[dict]:
             raise
         except Exception as exc:
             print(
-                f"Could not refresh exit quote for {signal['symbol']} "
+                f"Could not refresh option quote for {signal['symbol']} "
                 f"({type(exc).__name__}): {exc}",
                 file=sys.stderr,
             )
+        entry_quote = signal.get("option") or {}
+        entry_ask = float(entry_quote.get("ask") or 0)
+        current_bid = float((option_quote or {}).get("bid") or 0)
+        if entry_ask > 0 and current_bid > 0:
+            premium_ratio = current_bid / entry_ask
+            if premium_ratio <= PREMIUM_STOP_FRAC:
+                reason = "premium stop"
+                exit_price = float(future.iloc[0]["close"])  # underlying ref at first post-signal 5m bar
+                exit_time = future.index[0]
+                signal["premium_stop_ratio"] = round(premium_ratio, 3)
+
+        if reason is None:
+            for timestamp, candle in future.iterrows():
+                high, low = float(candle["high"]), float(candle["low"])
+                stop_hit = low <= stop if sign > 0 else high >= stop
+                target_hit = high >= target if sign > 0 else low <= target
+                if stop_hit:
+                    reason = "underlying stop"
+                    exit_price = min(stop, float(candle["open"])) if sign > 0 else max(stop, float(candle["open"]))
+                elif target_hit:
+                    reason = "underlying 2R target"
+                    exit_price = target
+                if reason:
+                    exit_time = timestamp
+                    break
+        if reason is None and current.time() >= FORCED_EXIT:
+            reason = "mandatory same-day exit"
+            exit_time = future.index[-1]
+            exit_price = float(future.iloc[-1]["close"])
+        if reason is None:
+            continue
 
         signal["status"] = "paper_exit_signal_sent"
         signal["exit_reason"] = reason

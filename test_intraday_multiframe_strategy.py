@@ -115,6 +115,63 @@ class IntradayMultiframeMonitorTests(unittest.TestCase):
         self.assertEqual(result, [])
         client.intraday.assert_not_called()
 
+    def test_premium_side_stop_fires_when_option_bid_collapses(self):
+        """When option bid falls to <= 60% of entry ask, exit as 'premium stop' even if underlying hasn't hit stop."""
+        signal = self._signal()
+        signal["option"] = {"strike": 100.0, "ask": 10.0, "bid": 10.0}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir)
+            path = output / f"{strategy.STRATEGY}_signals_2026-10-19.jsonl"
+            path.write_text(json.dumps(signal) + "\n", encoding="utf-8")
+            client = Mock()
+            client.intraday.return_value = self._candles()
+            # Option chain says current bid is 5.0 which is 50% of entry ask (10.0) -> below 60% threshold
+            client.option_chain.return_value = {
+                "oc": {
+                    "100": {"ce": {"top_bid_price": 5.0, "top_ask_price": 5.1, "last_price": 5.05}},
+                }
+            }
+            now = dt.datetime(2026, 10, 19, 15, 20, 20, tzinfo=core.IST)
+            with patch.object(core, "OUT", output), patch.dict(
+                "os.environ", {"TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": ""}
+            ):
+                exited = strategy.monitor_positions(client, now.date(), now)
+            self.assertEqual(len(exited), 1)
+            self.assertEqual(exited[0]["exit_reason"], "premium stop")
+            self.assertIn("premium_stop_ratio", exited[0])
+            self.assertLessEqual(exited[0]["premium_stop_ratio"], strategy.PREMIUM_STOP_FRAC)
+
+    def test_premium_side_stop_does_not_fire_when_option_holds_value(self):
+        signal = self._signal()
+        signal["option"] = {"strike": 100.0, "ask": 10.0, "bid": 10.0}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir)
+            path = output / f"{strategy.STRATEGY}_signals_2026-10-19.jsonl"
+            path.write_text(json.dumps(signal) + "\n", encoding="utf-8")
+            client = Mock()
+            # Underlying candles stay above stop and below target - no underlying exit
+            index = pd.DatetimeIndex([
+                "2026-10-19T10:00:00+05:30",
+                "2026-10-19T10:05:00+05:30",
+                "2026-10-19T10:10:00+05:30",
+            ])
+            client.intraday.return_value = pd.DataFrame(
+                {"open": [100, 101, 102], "high": [102, 103, 104],
+                 "low": [99, 100, 101], "close": [101, 102, 103], "volume": [10, 10, 10]},
+                index=index,
+            )
+            # Current bid 9.0 (90% of entry 10.0) - above 60% threshold
+            client.option_chain.return_value = {
+                "oc": {"100": {"ce": {"top_bid_price": 9.0, "top_ask_price": 9.2, "last_price": 9.1}}}
+            }
+            # Not yet past FORCED_EXIT so no mandatory exit either
+            now = dt.datetime(2026, 10, 19, 10, 15, 20, tzinfo=core.IST)
+            with patch.object(core, "OUT", output):
+                exited = strategy.monitor_positions(client, now.date(), now)
+            self.assertEqual(exited, [])
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["status"], "paper_entry_signal_sent")
+
     def test_forced_exit_waits_for_a_post_signal_candle(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir)

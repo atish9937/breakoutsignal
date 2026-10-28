@@ -39,6 +39,11 @@ OPTION_MIN_DTE_DAYS = 5
 OPTION_REQUIRE_BID = True
 OPTION_DELTA_FALLBACK = 0.5
 MAX_SIGNALS_PER_CYCLE = 3
+MIN_ADX = 20.0
+DAILY_SLOPE_LOOKBACK = 5          # bars used for the daily-EMA20 slope check
+BREADTH_MIN_PCT_FOR_CE = 55.0
+BREADTH_MAX_PCT_FOR_PE = 45.0
+VIX_SPIKE_MULTIPLIER = 1.30
 OUT = core.OUT
 
 
@@ -51,8 +56,15 @@ def record_check(checks, name, current, criterion, passed):
     })
 
 
-def evaluate_setup(symbol, candles, now, nifty_bias):
-    """Evaluate a completed-bar trend-pullback setup without making any API calls."""
+def evaluate_setup(symbol, candles, now, nifty_bias, daily_ctx=None,
+                   breadth=None, vix=None):
+    """Evaluate a completed-bar trend-pullback setup without making any API calls.
+
+    daily_ctx: optional dict with keys 'ema20_series' or 'slope' - used by the
+    multi-timeframe (daily) alignment gate. When absent the gate is skipped.
+    breadth: {'pct_above_prev_close': float|None, ...}; skipped if value is None.
+    vix:     {'ltp': float|None, 'ema20': float|None}; skipped if either is None.
+    """
     result = {
         "strategy": STRATEGY,
         "symbol": symbol,
@@ -171,6 +183,74 @@ def evaluate_setup(symbol, candles, now, nifty_bias):
     record_check(checks, "Entry time", now.strftime("%H:%M"),
                  f"{ENTRY_START.strftime('%H:%M')}–{ENTRY_END.strftime('%H:%M')} IST",
                  entry_allowed)
+
+    # ADX trend strength on the 5-minute series - trending-only strategy.
+    adx_value = core.adx(today)
+    adx_ok = adx_value is not None and adx_value >= MIN_ADX
+    record_check(checks, "ADX trend strength",
+                 "n/a" if adx_value is None else f"ADX14 {adx_value:.1f}",
+                 f">= {MIN_ADX:.1f}", adx_ok)
+    result["adx14_5m"] = core.r2(adx_value)
+
+    # Daily EMA20 slope must agree with the intraday trend direction (multi-timeframe gate).
+    daily_slope = None
+    if daily_ctx is not None:
+        if "slope" in daily_ctx and daily_ctx["slope"] is not None:
+            daily_slope = float(daily_ctx["slope"])
+        else:
+            ema20_series = daily_ctx.get("ema20_series")
+            if ema20_series is not None and len(ema20_series) >= DAILY_SLOPE_LOOKBACK + 1:
+                recent = ema20_series.tail(DAILY_SLOPE_LOOKBACK + 1)
+                daily_slope = float(recent.iloc[-1] - recent.iloc[0])
+    if daily_slope is None:
+        daily_ok = True
+        daily_slope_text = "daily EMA20 slope unavailable"
+    elif side == "CE":
+        daily_ok = daily_slope > 0
+        daily_slope_text = f"daily EMA20 slope {daily_slope:+.2f} over {DAILY_SLOPE_LOOKBACK} sessions"
+    else:
+        daily_ok = daily_slope < 0
+        daily_slope_text = f"daily EMA20 slope {daily_slope:+.2f} over {DAILY_SLOPE_LOOKBACK} sessions"
+    record_check(checks, "Daily trend", daily_slope_text,
+                 "slope in trade direction", daily_ok)
+
+    # Market breadth: % of universe above its prev close - internals must agree.
+    breadth_pct = (breadth or {}).get("pct_above_prev_close")
+    if breadth_pct is None:
+        breadth_ok = True
+        breadth_text = "breadth n/a"
+    elif side == "CE":
+        breadth_ok = breadth_pct >= BREADTH_MIN_PCT_FOR_CE
+        breadth_text = f"{breadth_pct:.1f}% above prev-close; need >= {BREADTH_MIN_PCT_FOR_CE:.0f}%"
+    else:
+        breadth_ok = breadth_pct <= BREADTH_MAX_PCT_FOR_PE
+        breadth_text = f"{breadth_pct:.1f}% above prev-close; need <= {BREADTH_MAX_PCT_FOR_PE:.0f}%"
+    record_check(checks, "Market breadth", breadth_text,
+                 "breadth aligned with trade direction", breadth_ok)
+    result["breadth_pct"] = core.r2(breadth_pct) if breadth_pct is not None else None
+
+    # India VIX regime: veto when VIX is spiking.
+    vix_ltp = (vix or {}).get("ltp")
+    vix_baseline = (vix or {}).get("ema20")
+    if vix_ltp is None or vix_baseline is None or vix_baseline <= 0:
+        vix_ok = True
+        vix_text = "VIX regime n/a"
+    else:
+        multiplier = vix_ltp / vix_baseline
+        vix_ok = multiplier <= VIX_SPIKE_MULTIPLIER
+        vix_text = (f"VIX {vix_ltp:.2f} / 20d-EMA {vix_baseline:.2f} = "
+                    f"{multiplier:.2f}x; cap {VIX_SPIKE_MULTIPLIER:.2f}x")
+    record_check(checks, "India VIX regime", vix_text,
+                 f"VIX / 20d-EMA <= {VIX_SPIKE_MULTIPLIER:.2f}", vix_ok)
+    result["vix"] = {"ltp": core.r2(vix_ltp), "ema20": core.r2(vix_baseline)} if vix_ltp is not None else None
+
+    # Momentum divergence veto (opposite of a fresh trend-pullback entry).
+    divergence = core.momentum_divergence(today, side)
+    divergence_ok = divergence is None
+    record_check(checks, "Momentum divergence",
+                 divergence or "no divergence detected",
+                 "no bearish RSI divergence for CE / no bullish for PE",
+                 divergence_ok)
 
     risk = atr_value
     result.update({
@@ -315,6 +395,74 @@ def notify_signal(result):
     )
 
 
+def _breadth_from_quotes(quotes: dict, symbols: dict[str, int]) -> dict:
+    """Fraction of universe trading above prev-close; prev-close read from the ohlc payload."""
+    eq_quotes = (quotes or {}).get("NSE_EQ") or {}
+    total = above = 0
+    for sid in symbols.values():
+        quote = eq_quotes.get(str(sid)) or {}
+        ltp = quote.get("last_price")
+        prev_close = (quote.get("ohlc") or {}).get("close")
+        if ltp is None or prev_close is None or prev_close <= 0:
+            continue
+        total += 1
+        if float(ltp) > float(prev_close):
+            above += 1
+    if total == 0:
+        return {"pct_above_prev_close": None, "sample": 0}
+    return {"pct_above_prev_close": round(100 * above / total, 2), "sample": total}
+
+
+_vix_baseline_cache: dict = {}
+
+
+def _fetch_vix(dh, day):
+    """Best-effort VIX fetch; errors zero the gate rather than aborting the scan."""
+    global _vix_baseline_cache
+    try:
+        snapshot = dh.ohlc({"IDX_I": [core.INDIA_VIX_ID]})
+        vix_quote = (snapshot.get("IDX_I") or {}).get(str(core.INDIA_VIX_ID), {})
+        ltp = vix_quote.get("last_price")
+    except Exception:  # noqa: BLE001
+        return {}
+    if _vix_baseline_cache.get("day") != day:
+        try:
+            vix_daily = dh.daily(core.INDIA_VIX_ID, seg="IDX_I", inst="INDEX", days=40)
+            if vix_daily is not None and not vix_daily.empty:
+                _vix_baseline_cache = {
+                    "day": day,
+                    "ema20": round(float(core.ema(vix_daily["close"], 20).iloc[-1]), 2),
+                }
+            else:
+                _vix_baseline_cache = {"day": day, "ema20": None}
+        except Exception:  # noqa: BLE001
+            _vix_baseline_cache = {"day": day, "ema20": None}
+    return {
+        "ltp": float(ltp) if ltp is not None else None,
+        "ema20": _vix_baseline_cache.get("ema20"),
+    }
+
+
+_daily_cache: dict[tuple[str, int], tuple[dt.date, pd.Series]] = {}
+
+
+def _daily_context(dh, symbol: str, sid: int, day: dt.date) -> dict:
+    """Return a cached dict with the daily EMA20 series (for slope checks)."""
+    key = (symbol, int(sid))
+    cached = _daily_cache.get(key)
+    if cached and cached[0] == day:
+        return {"ema20_series": cached[1]}
+    try:
+        daily = dh.daily(sid, days=80)
+        if daily is None or daily.empty:
+            return {}
+        ema20_series = core.ema(daily["close"], 20)
+    except Exception:  # noqa: BLE001
+        return {}
+    _daily_cache[key] = (day, ema20_series)
+    return {"ema20_series": ema20_series}
+
+
 def scan(dh, master, universe, exclude, expiry, day, now, fired):
     symbols = {symbol: sid for symbol, sid in universe.items() if symbol not in exclude}
     quotes = dh.ohlc({
@@ -322,13 +470,19 @@ def scan(dh, master, universe, exclude, expiry, day, now, fired):
         "IDX_I": [core.NIFTY_ID],
     })
     nifty = core.nifty_bias(dh, quotes, day, now)
+    breadth = _breadth_from_quotes(quotes, symbols)
+    vix = _fetch_vix(dh, day)
     results = []
     frm = dt.datetime.combine(day - dt.timedelta(days=4), dt.time(9, 15), core.IST)
     for symbol, sid in symbols.items():
         try:
+            daily_ctx = _daily_context(dh, symbol, sid, day)
             candles = dh.intraday(sid, frm, now)
             candles = candles[candles.index <= pd.Timestamp(now) - pd.Timedelta(minutes=5)]
-            result = evaluate_setup(symbol, candles, now, nifty)
+            result = evaluate_setup(
+                symbol, candles, now, nifty,
+                daily_ctx=daily_ctx, breadth=breadth, vix=vix,
+            )
             if result.get("verdict") == f"SETUP_{result.get('side')}":
                 if not expiry:
                     record_check(result["mechanical_checks"], "Option expiry",
