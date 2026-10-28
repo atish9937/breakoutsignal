@@ -1528,7 +1528,7 @@ def notify(r, order_state=None):
     text = (f"[BREAKOUT INTRADAY OPTIONS SIGNAL]\n"
             f"{r['verdict']} {r['symbol']} @ {r['ltp']} (trigger {r['trigger_level']}) - "
             f"validate catalyst/news before acting\n"
-            f"{o.get('contract')} ~Rs{o.get('premium')} lot {o.get('lot_size')}\n"
+            f"{o.get('contract')} [{o.get('selection', 'ATM')}] ~Rs{o.get('premium')} lot {o.get('lot_size')}\n"
             f"Stop {p.get('stop')} / prem {o.get('premium_stop')} | T1 {p.get('t1')} / {o.get('premium_t1')} | "
             f"T2 {p.get('t2')} / {o.get('premium_t2')}\nLoss/lot {o.get('loss_per_lot_at_stop')} "
             f"{r.get('risk_warning', '')}")
