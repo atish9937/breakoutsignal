@@ -198,9 +198,11 @@ CONFIG = {
     "max_option_spread_pct": 3.0,  # mechanical: option must be liquid enough to actually fill
     "option_min_premium": 2.0,     # reject penny / near-worthless strikes
     "option_min_oi": 1000,         # reject tiny OI (illiquid)
-    "option_min_delta": 0.30,      # reject deep-OTM lottery tickets (require real directional exposure)
+    "option_min_delta": 0.25,      # reject deep-OTM lottery tickets; 0.25 gives the strike-walker headroom
     "option_min_dte_days": 5,      # calendar days-to-expiry; blocks 0-DTE / expiry-week gamma traps
     "option_require_bid": True,    # bid must be > 0 - closes the "spread not available" bypass
+    "walk_strike_on_over_risk": True,  # if ATM breaches max_risk_pct, walk OTM to find a fitting strike
+    "max_strike_walks": 4,         # how many strikes OTM to try before giving up
     "min_adx": 20.0,               # 5-min ADX14 - require a trending market, reject chop
     "require_prior_day_level": True,  # CE: trigger must be at or beyond prior-day high. PE: at or beyond prior-day low
     "require_vwap_alignment": True,   # hard gate: price must be within max_vwap_dist_pct of VWAP in trade direction
@@ -824,7 +826,12 @@ def nifty_bias(dh: Dhan, quotes: dict, day: dt.date, now: dt.datetime) -> dict:
 
 
 def pick_option(chain: dict, side: str, ltp: float, entry: float):
-    """Return ATM strike data and the nearest OI wall in the trade direction + the opposite floor."""
+    """Return ATM strike data and the nearest OI wall in the trade direction + the opposite floor.
+
+    Also exposes a `walk_candidates` list of further-OTM (strike, leg_quote) pairs
+    in trade direction so evaluate() can walk to a cheaper strike when the ATM
+    exceeds the per-trade risk budget.
+    """
     oc = chain.get("oc") or {}
     rows = []
     for k, v in oc.items():
@@ -846,13 +853,24 @@ def pick_option(chain: dict, side: str, ltp: float, entry: float):
         wall = next((s for s, oi in above if mx and oi >= CONFIG["wall_frac"] * mx), None)
         below = [(s, pe.get("oi", 0) or 0) for s, _, pe in rows if s <= entry]
         floor = max(below, key=lambda x: x[1])[0] if below else None
+        # OTM for a CE = higher strikes
+        walk_candidates = [
+            (s, ce) for s, ce, _ in rows if s > atm[0]
+        ]
     else:
         below = [(s, pe.get("oi", 0) or 0) for s, _, pe in reversed(rows) if s < entry]
         mx = max([oi for _, oi in below], default=0)
         wall = next((s for s, oi in below if mx and oi >= CONFIG["wall_frac"] * mx), None)
         above = [(s, ce.get("oi", 0) or 0) for s, ce, _ in rows if s >= entry]
         floor = max(above, key=lambda x: x[1])[0] if above else None
-    return {"strike": atm[0], "opt": opt, "wall": wall, "opposite_wall": floor}
+        # OTM for a PE = lower strikes
+        walk_candidates = [
+            (s, pe) for s, _, pe in reversed(rows) if s < atm[0]
+        ]
+    return {
+        "strike": atm[0], "opt": opt, "wall": wall, "opposite_wall": floor,
+        "walk_candidates": walk_candidates,
+    }
 
 
 def nearest_level(p: dict, side: str, price: float) -> float:
@@ -1117,7 +1135,47 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
         if cap is not None:
             t1 = min(t1, cap) if side == "CE" else max(t1, cap)
             t2 = min(t2, cap) if side == "CE" else max(t2, cap)
+
+        # Strike selection with budget-aware walker. If the ATM contract's loss
+        # per lot exceeds max_risk_pct of capital, try progressively further-OTM
+        # strikes until one fits. Keep the ATM when the ATM already fits.
+        strike_selection = "ATM"
+        strike = opt_info["strike"]
         opt = opt_info["opt"] or {}
+
+        def _loss_pct_for(strike_val, opt_quote):
+            delta_raw_local = ((opt_quote or {}).get("greeks") or {}).get("delta")
+            if delta_raw_local is None:
+                return None
+            lot_local, _sid = lot_and_id(master, sym, prep["expiry"], strike_val, side)
+            if not lot_local or risk <= 0:
+                return None
+            loss = abs(float(delta_raw_local)) * risk * lot_local
+            return loss / CONFIG["capital"] * 100
+
+        budget_pct = CONFIG["max_risk_pct"]
+        if CONFIG.get("walk_strike_on_over_risk", True):
+            atm_loss_pct = _loss_pct_for(strike, opt)
+            if atm_loss_pct is not None and atm_loss_pct > budget_pct:
+                for walk_idx, (walk_strike, walk_opt) in enumerate(
+                    opt_info.get("walk_candidates") or []
+                ):
+                    if walk_idx >= CONFIG["max_strike_walks"]:
+                        break
+                    walk_delta_raw = ((walk_opt or {}).get("greeks") or {}).get("delta")
+                    walk_delta = abs(float(walk_delta_raw)) if walk_delta_raw is not None else None
+                    if walk_delta is None or walk_delta < CONFIG["option_min_delta"]:
+                        continue  # too deep OTM to be a real trade
+                    walk_loss_pct = _loss_pct_for(walk_strike, walk_opt)
+                    if walk_loss_pct is None:
+                        continue
+                    if walk_loss_pct <= budget_pct:
+                        strike = walk_strike
+                        opt = walk_opt
+                        strike_selection = f"OTM+{walk_idx + 1}"
+                        break
+        res["strike_selection"] = strike_selection
+
         prem = float(opt.get("last_price") or 0)
         bid, ask = float(opt.get("top_bid_price") or 0), float(opt.get("top_ask_price") or 0)
         spread = (ask - bid) / prem * 100 if prem and ask and bid else None
@@ -1166,13 +1224,14 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
             fails.append("option liquidity: " + "; ".join(reasons))
         if delta is None:
             delta = 0.5
-        lot, opt_sid = lot_and_id(master, sym, prep["expiry"], opt_info["strike"], side)
+        lot, opt_sid = lot_and_id(master, sym, prep["expiry"], strike, side)
         loss_lot = delta * risk * lot if lot else None
         plan.update({"t1": r2(t1), "t2": r2(t2), "next_wall": wall, "opposite_wall": opt_info["opposite_wall"],
                      "runway_r": r2(runway_r)})
         res["option"] = {
-            "contract": f"{sym} {prep['expiry']} {opt_info['strike']:g} {side}",
-            "security_id": opt_sid, "expiry": prep["expiry"], "strike": opt_info["strike"], "type": side,
+            "contract": f"{sym} {prep['expiry']} {strike:g} {side}",
+            "security_id": opt_sid, "expiry": prep["expiry"], "strike": strike, "type": side,
+            "selection": strike_selection,
             "premium": r2(prem), "bid": r2(bid), "ask": r2(ask), "iv": r2(opt.get("implied_volatility")),
             "oi": opt.get("oi"), "delta_used": r2(delta), "lot_size": lot,
             "cost_per_lot": r2(prem * lot) if lot else None,
