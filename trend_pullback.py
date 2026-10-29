@@ -44,6 +44,9 @@ DAILY_SLOPE_LOOKBACK = 5          # bars used for the daily-EMA20 slope check
 BREADTH_MIN_PCT_FOR_CE = 55.0
 BREADTH_MAX_PCT_FOR_PE = 45.0
 VIX_SPIKE_MULTIPLIER = 1.30
+MIN_T1_DISTANCE_PCT = 0.40       # Commit G: reject when T1 is < 0.40% of entry -
+                                  # option bid/ask spread + slippage would eat any
+                                  # realistic gain (ONGC 2026-10-29 was the case study)
 OUT = core.OUT
 
 
@@ -253,17 +256,28 @@ def evaluate_setup(symbol, candles, now, nifty_bias, daily_ctx=None,
                  divergence_ok)
 
     risk = atr_value
+    entry_price = float(last["close"])
+    t1_price = entry_price + sign * risk
+    # Commit G: minimum T1 distance filter - stops ONGC-style tiny-ATR traps
+    # where option spread + slippage would exceed the realistic gain.
+    t1_distance_pct = abs(t1_price - entry_price) / entry_price * 100 if entry_price else 0
+    t1_distance_ok = t1_distance_pct >= MIN_T1_DISTANCE_PCT
+    record_check(checks, "T1 distance",
+                 f"{t1_distance_pct:.2f}% of underlying",
+                 f">= {MIN_T1_DISTANCE_PCT:.2f}% (so option can clear spread + slippage)",
+                 t1_distance_ok)
+
     result.update({
         "vwap": core.r2(vw),
         "rsi14_5m": core.r2(rs),
         "macd_hist_5m": core.r2(macd),
         "atr_5m": core.r2(atr_value),
         "plan": {
-            "entry": core.r2(float(last["close"])),
-            "stop": core.r2(float(last["close"]) - sign * risk),
+            "entry": core.r2(entry_price),
+            "stop": core.r2(entry_price - sign * risk),
             "risk_per_share": core.r2(risk),
-            "t1": core.r2(float(last["close"]) + sign * risk),
-            "t2": core.r2(float(last["close"]) + sign * 2 * risk),
+            "t1": core.r2(t1_price),
+            "t2": core.r2(entry_price + sign * 2 * risk),
         },
     })
     result["fails"] = [check["gate"] for check in checks if not check["passed"]]

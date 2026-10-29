@@ -85,6 +85,15 @@ class BreakoutConfigTests(unittest.TestCase):
         self.assertGreaterEqual(breakout_scanner.CONFIG["max_strike_walks"], 1)
         self.assertEqual(breakout_scanner.CONFIG["option_min_delta"], 0.25)
 
+    def test_commit_g_macd_hard_gate_and_min_t1_distance_defaults(self):
+        """Commit G defaults - after SUNPHARMA (MACD -0.32 but RSI OK) and
+        ONGC (T1 only 0.23% away) losses on 2026-10-29."""
+        self.assertTrue(breakout_scanner.CONFIG["require_macd_momentum"])
+        self.assertEqual(breakout_scanner.CONFIG["min_t1_distance_pct"], 0.40)
+        # Same gate exists in trend_pullback
+        import trend_pullback
+        self.assertEqual(trend_pullback.MIN_T1_DISTANCE_PCT, 0.40)
+
 
 class StrikeWalkerTests(unittest.TestCase):
     """pick_option now exposes walk_candidates so evaluate() can scan OTM strikes."""

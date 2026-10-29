@@ -207,6 +207,12 @@ CONFIG = {
     "require_prior_day_level": True,  # CE: trigger must be at or beyond prior-day high. PE: at or beyond prior-day low
     "require_vwap_alignment": True,   # hard gate: price must be within max_vwap_dist_pct of VWAP in trade direction
     "veto_momentum_divergence": True, # bearish RSI divergence vetoes CE; bullish vetoes PE
+    "require_macd_momentum": True,    # Commit G: hard gate (not scored) - MACD histogram sign
+                                       # must agree with trade direction. Catches "RSI OK but
+                                       # MACD rolling over" cases like SUNPHARMA CE 2026-10-29.
+    "min_t1_distance_pct": 0.40,      # Commit G: reject when T1 is < 0.40% of underlying -
+                                       # option bid/ask spread + slippage would eat the win.
+                                       # Catches small-ATR trap trades (e.g. ONGC 2026-10-29).
     "breadth_min_pct_for_ce": 55.0,   # at least 55% of universe trading above its own VWAP for CE
     "breadth_max_pct_for_pe": 45.0,   # at most 45% of universe above its VWAP for PE (i.e. >=55% below VWAP)
     "vix_spike_multiplier": 1.30,     # veto new entries when India VIX > 1.30 * its own 20-day EMA
@@ -1065,6 +1071,23 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
     else:
         passes.append("no RSI divergence")
 
+    # MACD momentum - hard gate. The existing quality-score 'mom' factor OR's
+    # RSI and MACD so a signal with just-OK RSI but weakening MACD still scores.
+    # SUNPHARMA 2026-10-29 was a textbook failure of that logic: RSI 55.3 (just
+    # barely above the 55 floor) but MACD histogram -0.32 (negative). Hard gate
+    # now requires MACD sign to agree with trade direction.
+    if CONFIG.get("require_macd_momentum", True):
+        macd_ok = (mh > 0) if side == "CE" else (mh < 0)
+        record_check(
+            "MACD momentum",
+            f"histogram {mh:+.3f}",
+            "> 0 for CE / < 0 for PE",
+            macd_ok,
+        )
+        (passes if macd_ok else fails).append(f"macd hist {mh:+.3f}")
+    else:
+        macd_ok = True
+
     # Market-breadth filter - directional bets need internals to agree.
     breadth_pct = (breadth or {}).get("pct_above_prev_close")
     if breadth_pct is None:
@@ -1128,7 +1151,7 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
             raise
         except Exception as e:  # noqa: BLE001
             fails.append(f"option chain error {e}")
-    runway_ok = liquid_ok = False
+    runway_ok = liquid_ok = t1_distance_ok = False
     if opt_info is None and not any("option chain error" in f for f in fails):
         fails.append("no option chain data (no expiry or chain unavailable) - "
                      "runway and liquidity can't be checked")
@@ -1146,6 +1169,24 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
         if cap is not None:
             t1 = min(t1, cap) if side == "CE" else max(t1, cap)
             t2 = min(t2, cap) if side == "CE" else max(t2, cap)
+
+        # MIN_T1_DISTANCE_PCT - reject when T1 is so close to entry that option
+        # bid/ask spread + slippage would eat any realistic gain. ONGC 2026-10-29
+        # was the clearest failure: T1 only 0.23% away from entry (0.52 pts on a
+        # 225 stock, 1.2% option spread) - option could not have profitable
+        # mathematically even if T1 hit.
+        t1_distance_pct = abs(t1 - entry) / entry * 100 if entry else 0
+        t1_distance_ok = t1_distance_pct >= CONFIG["min_t1_distance_pct"]
+        record_check(
+            "T1 distance",
+            f"{t1_distance_pct:.2f}% of underlying",
+            f">= {CONFIG['min_t1_distance_pct']:.2f}% (so option can clear spread + slippage)",
+            t1_distance_ok,
+        )
+        if not t1_distance_ok:
+            fails.append(f"T1 only {t1_distance_pct:.2f}% away")
+        else:
+            passes.append(f"T1 distance {t1_distance_pct:.2f}%")
 
         # Strike selection with budget-aware walker. If the ATM contract's loss
         # per lot exceeds max_risk_pct of capital, try progressively further-OTM
@@ -1292,6 +1333,8 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
         "prior-day level cleared": prior_ok,
         "VWAP aligned": (vwap_ok if CONFIG.get("require_vwap_alignment", True) else True),
         "no RSI divergence": divergence_ok,
+        "MACD momentum": macd_ok,
+        "T1 distance clears spread": t1_distance_ok,
         "market breadth aligned": breadth_ok,
         "India VIX regime": vix_ok,
     }
