@@ -302,6 +302,32 @@ class IndexSupportTests(unittest.TestCase):
         self.assertEqual(core.LOT_FALLBACK.get("NIFTY"), 25)
         self.assertEqual(core.LOT_FALLBACK.get("BANKNIFTY"), 15)
 
+    def test_index_prev_high_low_caches_per_day(self):
+        """A 60-cycle session must only hit dh.daily once per index per day."""
+        day = dt.date(2026, 10, 29)
+        idx = pd.date_range("2026-10-27", periods=3, freq="D", tz=IST)
+        daily = pd.DataFrame(
+            {"open": [100]*3, "high": [110, 115, 120], "low": [95, 93, 97],
+             "close": [105, 108, 112], "volume": [0]*3},
+            index=idx,
+        )
+
+        calls = []
+
+        class _CountingStub:
+            def daily(self, sid, seg, inst, days):
+                calls.append(sid)
+                return daily
+        # clear the cache first so results are deterministic
+        strategy._index_prev_hl_cache.clear()
+        stub = _CountingStub()
+        first = strategy._index_prev_high_low(stub, 13, "IDX_I", day)
+        second = strategy._index_prev_high_low(stub, 13, "IDX_I", day)
+        third = strategy._index_prev_high_low(stub, 13, "IDX_I", day)
+        self.assertEqual(len(calls), 1, "second and third fetches should hit the cache")
+        self.assertEqual(first, second)
+        self.assertEqual(second, third)
+
 
 if __name__ == "__main__":
     unittest.main()

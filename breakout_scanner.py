@@ -216,7 +216,7 @@ CONFIG = {
     "run_end": "12:35",
     "extended_entry_cutoff": "14:30",  # tightened from 15:00 so entries have >=45 min to resolve
     "extended_run_end": "15:05",
-    "max_candidates_per_scan": 15,  # option-chain calls are slow (1 per 3 s)
+    "max_candidates_per_scan": 25,  # top-N candidates to fully evaluate per cycle (option-chain cap)
 }
 
 MIN_DISPLAY_QUALITY = 3

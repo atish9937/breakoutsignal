@@ -636,18 +636,31 @@ def _fetch_vix(dh, day):
     }
 
 
+_index_prev_hl_cache: dict[int, tuple[dt.date, float | None, float | None]] = {}
+
+
 def _index_prev_high_low(dh, sid: int, seg: str, day: dt.date) -> tuple[float | None, float | None]:
-    """Fetch yesterday's completed-session high/low for an index."""
+    """Fetch yesterday's completed-session high/low for an index. Cached per-day
+    so a 60-cycle session only hits dh.daily once per index."""
+    cached = _index_prev_hl_cache.get(sid)
+    if cached and cached[0] == day:
+        return cached[1], cached[2]
     try:
         daily = dh.daily(sid, seg=seg, inst="INDEX", days=5)
     except Exception:  # noqa: BLE001
+        _index_prev_hl_cache[sid] = (day, None, None)
         return None, None
     if daily is None or daily.empty:
+        _index_prev_hl_cache[sid] = (day, None, None)
         return None, None
     prior = daily[daily.index.date < day]
     if prior.empty:
+        _index_prev_hl_cache[sid] = (day, None, None)
         return None, None
-    return float(prior["high"].iloc[-1]), float(prior["low"].iloc[-1])
+    prev_high = float(prior["high"].iloc[-1])
+    prev_low = float(prior["low"].iloc[-1])
+    _index_prev_hl_cache[sid] = (day, prev_high, prev_low)
+    return prev_high, prev_low
 
 
 def _pick_index_expiry(dh, sid: int, seg: str, day: dt.date,
