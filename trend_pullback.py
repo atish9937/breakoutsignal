@@ -538,6 +538,13 @@ def scan(dh, master, universe, exclude, expiry, day, now, fired):
     for result in buys:
         key = f"{result['symbol']}_{result['side']}"
         if key in fired:
+            # Another scanner already recommended this (symbol, side) today.
+            # Downgrade the verdict so record_buy_recommendations downstream
+            # doesn't insert this duplicate into paper_trades.
+            result["verdict"] = f"WATCH_{result['side']}"
+            result.setdefault("fails", []).append(
+                "already recommended today by another scanner (cross-strategy dedupe)"
+            )
             continue
         fired.add(key)
         with open(signal_path, "a", encoding="utf-8") as stream:

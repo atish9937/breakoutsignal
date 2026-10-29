@@ -1453,24 +1453,34 @@ def scan(dh, master, prep, day, exclude, fired, universe=None, ignore_entry_cuto
     new_signals = []
     for r in results:
         key = f"{r['symbol']}_{r['side']}"
-        if r["verdict"].startswith("BUY") and key not in fired:
-            fired.add(key)
-            new_signals.append(r)
-            order_state = {"status": "DISABLED"}
-            if live_orders_enabled:
-                order_state = {"status": "ARMED"}
-            signal = {"type": "SIGNAL", "scan_time": snapshot["scan_time"], "nifty": nifty,
-                      "execution": order_state, **r}
-            with open(OUT / f"signals_{day}.jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps(signal) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-            print("\n=========== RECOMMENDATION FOR AI VALIDATION (copy from here) ===========")
-            print(json.dumps(signal, indent=2))
-            print("=========== END RECOMMENDATION - script says BUY, AI must validate it ===========\n")
-            if live_orders_enabled:
-                order_state = submit_live_order(dh, r, day)
-            notify(r, order_state)
+        if not r["verdict"].startswith("BUY"):
+            continue
+        if key in fired:
+            # Another scanner (or an earlier cycle today) already recommended
+            # this (symbol, side). Downgrade the verdict so downstream
+            # record_buy_recommendations doesn't double-insert into paper_trades.
+            r["verdict"] = f"WATCH_{r['side']}"
+            r.setdefault("fails", []).append(
+                "already recommended today by another scanner (cross-strategy dedupe)"
+            )
+            continue
+        fired.add(key)
+        new_signals.append(r)
+        order_state = {"status": "DISABLED"}
+        if live_orders_enabled:
+            order_state = {"status": "ARMED"}
+        signal = {"type": "SIGNAL", "scan_time": snapshot["scan_time"], "nifty": nifty,
+                  "execution": order_state, **r}
+        with open(OUT / f"signals_{day}.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(signal) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        print("\n=========== RECOMMENDATION FOR AI VALIDATION (copy from here) ===========")
+        print(json.dumps(signal, indent=2))
+        print("=========== END RECOMMENDATION - script says BUY, AI must validate it ===========\n")
+        if live_orders_enabled:
+            order_state = submit_live_order(dh, r, day)
+        notify(r, order_state)
     if new_signals:
         # One batch per scan, every new recommendation together, so the cross-recommendation
         # correlation and regime checks in "ai_validation" actually have something to compare.

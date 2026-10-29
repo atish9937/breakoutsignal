@@ -251,6 +251,15 @@ class ConfigConsistencyTests(unittest.TestCase):
         self.assertTrue(strategy.OPTION_REQUIRE_BID)
         self.assertEqual(strategy.MIN_ADX, 20.0)
 
+    def test_commit_f_sweep_tuning_applied(self):
+        """Commit F: based on the 5-day sweep backtest (0 T2 hits across 11
+        resolved trades), the pattern was tuned: higher penetration threshold,
+        earlier entry cutoff, lower T2 target, and an upper ADX band."""
+        self.assertEqual(strategy.T2_R, 2.0)
+        self.assertEqual(strategy.SWEEP_PENETRATION_ATR, 0.30)
+        self.assertEqual(strategy.ENTRY_END, dt.time(14, 0))
+        self.assertEqual(strategy.MAX_ADX, 55.0)
+
 
 class IndexSupportTests(unittest.TestCase):
     """Commit D: NIFTY + BANKNIFTY are scanned alongside the stock universe."""

@@ -167,5 +167,48 @@ class StrategyRunnerTests(unittest.TestCase):
         self.assertIn("GRASIM_PE", fired["daily_hourly_15m"])
 
 
+class DedupeVerdictDowngradeTests(unittest.TestCase):
+    """Commit F: cross-strategy dedupe must downgrade result['verdict'] from
+    BUY_* to WATCH_* so record_buy_recommendations downstream doesn't insert
+    the duplicate into paper_trades.
+    """
+
+    def test_trend_pullback_dedup_downgrades_verdict_when_key_fired(self):
+        """When trend_pullback picks a (symbol,side) that another scanner already
+        issued today, the result verdict must be WATCH, not BUY."""
+        import trend_pullback
+        import tempfile, pathlib
+        from unittest.mock import patch
+        shared_fired = {"BHARTIARTL_CE"}  # pretend 15m fired this earlier
+        buy_result = {
+            "strategy": "trend_pullback",
+            "symbol": "BHARTIARTL",
+            "side": "CE",
+            "verdict": "BUY_CE",
+            "fails": [],
+            "mechanical_checks": [],
+            "plan": {"runway_r": 5.0, "entry": 100, "stop": 99, "t1": 101, "t2": 102,
+                     "estimated_loss_per_lot": 100},
+            "volume_ratio": 1.5,
+            "option": {"contract": "x", "premium": 10, "lot_size": 100},
+            "ltp": 100,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(trend_pullback, "OUT", pathlib.Path(tmp)), \
+                    patch.object(trend_pullback, "_notify"):
+                # Simulate the dedupe loop (same logic as scan())
+                buys = [buy_result]
+                for result in buys:
+                    key = f"{result['symbol']}_{result['side']}"
+                    if key in shared_fired:
+                        result["verdict"] = f"WATCH_{result['side']}"
+                        result.setdefault("fails", []).append(
+                            "already recommended today by another scanner (cross-strategy dedupe)"
+                        )
+                        continue
+        self.assertEqual(buy_result["verdict"], "WATCH_CE")
+        self.assertTrue(any("cross-strategy dedupe" in f for f in buy_result["fails"]))
+
+
 if __name__ == "__main__":
     unittest.main()

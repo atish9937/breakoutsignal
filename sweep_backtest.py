@@ -135,7 +135,8 @@ def backtest_symbol(dh, symbol: str, sid: int, seg: str, inst: str,
         if not ok:
             continue
         adx_value = core.adx(today.iloc[: i + 1])
-        adx_ok = adx_value is not None and adx_value >= ls.MIN_ADX
+        adx_ok = (adx_value is not None
+                  and ls.MIN_ADX <= adx_value <= ls.MAX_ADX)
         if not adx_ok:
             continue
 

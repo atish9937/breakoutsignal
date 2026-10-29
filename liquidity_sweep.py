@@ -53,14 +53,19 @@ STRATEGY = "liquidity_sweep"
 RUN_START = dt.time(9, 30)        # skip the first 15 minutes (opening-range noise)
 RUN_END = dt.time(14, 30)
 ENTRY_START = dt.time(9, 45)      # need two completed bars + opening noise to settle
-ENTRY_END = dt.time(14, 30)
+ENTRY_END = dt.time(14, 0)        # Commit F: tightened from 14:30 - sweeps need 90+ min
+                                   # to work a 2R move; 5-day backtest showed 10/11 of
+                                   # the 14:30-15:10 entries ended "unresolved_at_close"
 
 # Pool identification
 PIVOT_LOOKBACK = 20                # bars scanned for swing extremes
 PIVOT_WIDTH = 2                    # a pivot is a local extreme over +/- this many bars
 
 # Sweep bar
-SWEEP_PENETRATION_ATR = 0.10       # pierce the pool by >= this * ATR
+SWEEP_PENETRATION_ATR = 0.30       # Commit F: raised from 0.10 - 7 of 11 stops in the
+                                   # 5-day backtest were shallow pokes (pen < 0.5 ATR)
+                                   # during ADX>25 regimes, which are usually trend
+                                   # continuation, not stop-hunt reversals
 SWEEP_WICK_RATIO = 0.50            # wick in sweep direction >= this fraction of total range
 SWEEP_VOLUME_RATIO = 1.3           # sweep bar volume >= this * 20-bar avg
 
@@ -71,10 +76,15 @@ CONFIRMATION_CLOSE_FRAC = 0.30     # close in top/bottom this fraction of its ow
 # Risk
 STOP_WICK_BUFFER_ATR = 0.10        # stop placed this * ATR beyond the sweep wick
 T1_R = 1.5
-T2_R = 2.5
+T2_R = 2.0                         # Commit F: dropped from 2.5R - backtest showed 0 T2
+                                   # hits across 11 resolved trades. 2.0R is realistic
+                                   # intraday on Nifty50 names; still a 2:1 R/R vs the stop
 
 # Market regime
 MIN_ADX = 20.0
+MAX_ADX = 55.0                     # Commit F: NEW - sweeps don't reverse in runaway
+                                   # trends. Backtest showed stops cluster at ADX>55
+                                   # (strong trend keeps going, no stop-hunt reversal)
 MAX_SIGNALS_PER_CYCLE = 2
 
 # Option gates (keep in lock-step with the other strategies)
@@ -356,12 +366,14 @@ def evaluate_setup(symbol: str, candles: pd.DataFrame, now: dt.datetime,
         result["fails"].append("confirmation failed")
         return result
 
-    # ADX trend-strength: like the other strategies, keep us out of chop.
+    # ADX trend-strength band: too-weak = chop (no clear structure to sweep).
+    # Too-strong = runaway trend (sweep is usually a continuation flag, not a reversal).
     adx_value = core.adx(today)
-    adx_ok = adx_value is not None and adx_value >= MIN_ADX
+    adx_ok = (adx_value is not None
+              and MIN_ADX <= adx_value <= MAX_ADX)
     _record(checks, "ADX trend strength",
             "n/a" if adx_value is None else f"ADX14 {adx_value:.1f}",
-            f">= {MIN_ADX:.1f}", adx_ok)
+            f"between {MIN_ADX:.0f} and {MAX_ADX:.0f}", adx_ok)
 
     # Nifty alignment: sweeps against Nifty bias are lower probability.
     aligned = ((side == "CE" and nifty_bias.get("bias") != "DOWN")
@@ -797,6 +809,12 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
     for result in buys:
         key = f"{result['symbol']}_{result['side']}"
         if key in fired:
+            # Another scanner already recommended this (symbol, side) today.
+            # Downgrade so record_buy_recommendations doesn't double-insert.
+            result["verdict"] = f"WATCH_{result['side']}"
+            result.setdefault("fails", []).append(
+                "already recommended today by another scanner (cross-strategy dedupe)"
+            )
             continue
         fired.add(key)
         with open(signal_path, "a", encoding="utf-8") as stream:
@@ -810,7 +828,7 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
         for prefix in ("BUY_", "WATCH_", "SKIP")
     }
     print(f"\n[{snapshot['scan_time']}] Liquidity Sweep | Nifty {nifty.get('bias')} | "
-          f"expiry {expiry or 'unavailable'} | candidates {len(results)}")
+          f"stock expiry {stock_expiry or 'unavailable'} | candidates {len(results)}")
     print(f"  BUY: {counts['BUY_']} | WATCH: {counts['WATCH_']} | SKIP: {counts['SKIP']}")
     return snapshot
 
