@@ -274,11 +274,21 @@ def _confirms(confirmation_bar: pd.Series, sweep_bar: pd.Series,
 
 def evaluate_setup(symbol: str, candles: pd.DataFrame, now: dt.datetime,
                    prev_high: float | None, prev_low: float | None,
-                   nifty_bias: dict, vix: dict | None = None) -> dict:
+                   nifty_bias: dict, vix: dict | None = None,
+                   prior_week_high: float | None = None,
+                   prior_week_low: float | None = None,
+                   prior_month_high: float | None = None,
+                   prior_month_low: float | None = None) -> dict:
     """Evaluate the last-closed 5-min bar as a potential sweep + confirmation entry.
 
     `candles` must be the 5-min candle series (completed bars only). The
     second-to-last bar is tested as the SWEEP, the last bar as the CONFIRMATION.
+
+    Pools considered (any of these levels count as liquidity to sweep):
+      * 5-minute swing pivots (last 20 bars this session)
+      * prior session's high and low (classic session levels)
+      * prior ISO week's high and low (where swing stops cluster)   [Commit H]
+      * prior calendar month's high and low (institutional pivots)  [Commit H]
     """
     result = {
         "strategy": STRATEGY,
@@ -319,18 +329,34 @@ def evaluate_setup(symbol: str, candles: pd.DataFrame, now: dt.datetime,
     pivot_highs, pivot_lows = _find_pivots(prev_window, PIVOT_WIDTH)
     pool_highs = list(pivot_highs)
     pool_lows = list(pivot_lows)
-    if prev_high is not None:
-        pool_highs.append(float(prev_high))
-    if prev_low is not None:
-        pool_lows.append(float(prev_low))
+    pool_sources: dict[float, str] = {}
+    for level, label in (
+        (prev_high, "prev_session_high"),
+        (prior_week_high, "prior_week_high"),
+        (prior_month_high, "prior_month_high"),
+    ):
+        if level is not None:
+            pool_highs.append(float(level))
+            pool_sources[float(level)] = label
+    for level, label in (
+        (prev_low, "prev_session_low"),
+        (prior_week_low, "prior_week_low"),
+        (prior_month_low, "prior_month_low"),
+    ):
+        if level is not None:
+            pool_lows.append(float(level))
+            pool_sources[float(level)] = label
 
     sweep = _detect_sweep(sweep_bar, prev_window, pool_highs, pool_lows, atr_value)
     sweep_passed = sweep is not None
+    if sweep_passed:
+        # Tag which pool was swept so the Telegram alert / report shows context
+        sweep["pool_source"] = pool_sources.get(float(sweep["pool_level"]), "swing_pivot")
     _record(
         checks,
         "Liquidity sweep bar",
-        (f"side={sweep['side']}; pool={sweep['pool_level']:.2f}; "
-         f"pen={sweep['penetration_atr']:.2f}x ATR; "
+        (f"side={sweep['side']}; pool={sweep['pool_level']:.2f} "
+         f"({sweep['pool_source']}); pen={sweep['penetration_atr']:.2f}x ATR; "
          f"wick={sweep['wick_ratio']:.2f}; vol={sweep['volume_ratio']:.2f}x avg")
         if sweep_passed else
         f"no sweep (pools above={len(pool_highs)}, below={len(pool_lows)})",
@@ -441,6 +467,7 @@ def evaluate_setup(symbol: str, candles: pd.DataFrame, now: dt.datetime,
         "adx14_5m": core.r2(adx_value),
         "sweep": {
             "pool_level": core.r2(sweep["pool_level"]),
+            "pool_source": sweep.get("pool_source", "swing_pivot"),
             "sweep_extreme": core.r2(sweep["sweep_extreme"]),
             "penetration_atr": round(sweep["penetration_atr"], 3),
             "wick_ratio": round(sweep["wick_ratio"], 3),
@@ -606,8 +633,9 @@ def notify_signal(result: dict) -> None:
     option, plan, sweep = result["option"], result["plan"], result["sweep"]
     _notify(
         f"[Liquidity Sweep] {result['verdict']} {result['symbol']} underlying {result['ltp']}\n"
-        f"Swept {sweep['pool_level']} ({sweep['penetration_atr']:.2f}x ATR, "
-        f"wick {sweep['wick_ratio']:.0%}) + displacement confirmed\n"
+        f"Swept {sweep['pool_level']} [{sweep.get('pool_source', 'swing_pivot')}] "
+        f"({sweep['penetration_atr']:.2f}x ATR, wick {sweep['wick_ratio']:.0%}) "
+        "+ displacement confirmed\n"
         f"{option['contract']} [{option['selection']}] ~Rs{option['premium']} | "
         f"lot {option['lot_size']}\n"
         f"Entry {plan['entry']} | stop {plan['stop']} | T1 {plan['t1']} | T2 {plan['t2']}\n"
@@ -648,31 +676,50 @@ def _fetch_vix(dh, day):
     }
 
 
-_index_prev_hl_cache: dict[int, tuple[dt.date, float | None, float | None]] = {}
+_index_hl_cache: dict[int, tuple[dt.date, dict]] = {}
+
+
+def _index_hl_pools(dh, sid: int, seg: str, day: dt.date) -> dict:
+    """Fetch all liquidity-pool levels for an index: prior-session, prior-week,
+    prior-month highs and lows. Cached per-day so one dh.daily per index per day."""
+    cached = _index_hl_cache.get(sid)
+    if cached and cached[0] == day:
+        return cached[1]
+    try:
+        # 40 trading days = ~2 calendar months, enough for prior-month calc
+        daily = dh.daily(sid, seg=seg, inst="INDEX", days=60)
+    except Exception:  # noqa: BLE001
+        _index_hl_cache[sid] = (day, {})
+        return {}
+    if daily is None or daily.empty:
+        _index_hl_cache[sid] = (day, {})
+        return {}
+    prior = daily[daily.index.date < day]
+    if prior.empty:
+        _index_hl_cache[sid] = (day, {})
+        return {}
+    prev_high = float(prior["high"].iloc[-1])
+    prev_low = float(prior["low"].iloc[-1])
+    pw_high, pw_low = core.prior_week_high_low(prior, day)
+    pm_high, pm_low = core.prior_month_high_low(prior, day)
+    pools = {
+        "prev_high": prev_high, "prev_low": prev_low,
+        "prior_week_high": pw_high, "prior_week_low": pw_low,
+        "prior_month_high": pm_high, "prior_month_low": pm_low,
+    }
+    _index_hl_cache[sid] = (day, pools)
+    return pools
 
 
 def _index_prev_high_low(dh, sid: int, seg: str, day: dt.date) -> tuple[float | None, float | None]:
-    """Fetch yesterday's completed-session high/low for an index. Cached per-day
-    so a 60-cycle session only hits dh.daily once per index."""
-    cached = _index_prev_hl_cache.get(sid)
-    if cached and cached[0] == day:
-        return cached[1], cached[2]
-    try:
-        daily = dh.daily(sid, seg=seg, inst="INDEX", days=5)
-    except Exception:  # noqa: BLE001
-        _index_prev_hl_cache[sid] = (day, None, None)
-        return None, None
-    if daily is None or daily.empty:
-        _index_prev_hl_cache[sid] = (day, None, None)
-        return None, None
-    prior = daily[daily.index.date < day]
-    if prior.empty:
-        _index_prev_hl_cache[sid] = (day, None, None)
-        return None, None
-    prev_high = float(prior["high"].iloc[-1])
-    prev_low = float(prior["low"].iloc[-1])
-    _index_prev_hl_cache[sid] = (day, prev_high, prev_low)
-    return prev_high, prev_low
+    """Back-compat shim for tests - returns just (prev_high, prev_low) from the
+    full pool dict. New code should use _index_hl_pools."""
+    pools = _index_hl_pools(dh, sid, seg, day)
+    return pools.get("prev_high"), pools.get("prev_low")
+
+
+# Legacy name kept for backwards-compatible tests
+_index_prev_hl_cache = _index_hl_cache
 
 
 def _pick_index_expiry(dh, sid: int, seg: str, day: dt.date,
@@ -709,6 +756,28 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
 
     results: list[dict] = []
     stocks = prep.get("stocks") or {}
+    signal_path = OUT / f"{STRATEGY}_signals_{day}.jsonl"
+
+    def _fire_if_ready(result: dict) -> None:
+        """Immediate dedupe + file-write + Telegram when a BUY is confirmed.
+        Called inside the per-symbol loop so Telegram arrives sub-second after
+        the gates pass, not after the whole 50-symbol scan completes.
+        """
+        if not result.get("verdict", "").startswith("BUY_"):
+            return
+        key = f"{result['symbol']}_{result['side']}"
+        if key in fired:
+            result["verdict"] = f"WATCH_{result['side']}"
+            result.setdefault("fails", []).append(
+                "already recommended today by another scanner (cross-strategy dedupe)"
+            )
+            return
+        fired.add(key)
+        with open(signal_path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(result) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        notify_signal(result)
 
     # ---- Equity universe -----------------------------------------------------
     for symbol, sid in universe.items():
@@ -716,9 +785,15 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
             candles = dh.intraday(sid, frm, now)
             candles = candles[candles.index <= pd.Timestamp(now) - pd.Timedelta(minutes=5)]
             prep_entry = stocks.get(symbol) or {}
-            prev_high = prep_entry.get("prev_high")
-            prev_low = prep_entry.get("prev_low")
-            result = evaluate_setup(symbol, candles, now, prev_high, prev_low, nifty, vix)
+            result = evaluate_setup(
+                symbol, candles, now,
+                prep_entry.get("prev_high"), prep_entry.get("prev_low"),
+                nifty, vix,
+                prior_week_high=prep_entry.get("prior_week_high"),
+                prior_week_low=prep_entry.get("prior_week_low"),
+                prior_month_high=prep_entry.get("prior_month_high"),
+                prior_month_low=prep_entry.get("prior_month_low"),
+            )
             if result.get("verdict") == f"SETUP_{result.get('side')}":
                 if not stock_expiry:
                     _record(result["mechanical_checks"], "Option expiry",
@@ -728,6 +803,7 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
                 else:
                     chain = dh.option_chain(sid, stock_expiry)
                     result = attach_option_check(result, master, stock_expiry, chain, day=day)
+            _fire_if_ready(result)
             results.append(result)
         except core.DhanAuthError:
             raise
@@ -746,10 +822,18 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
         sid = cfg["sid"]
         seg = cfg["underlying_seg"]
         try:
-            prev_high, prev_low = _index_prev_high_low(dh, sid, seg, day)
+            pools = _index_hl_pools(dh, sid, seg, day)
             candles = dh.intraday(sid, frm, now, seg=seg, inst="INDEX")
             candles = candles[candles.index <= pd.Timestamp(now) - pd.Timedelta(minutes=5)]
-            result = evaluate_setup(index_name, candles, now, prev_high, prev_low, nifty, vix)
+            result = evaluate_setup(
+                index_name, candles, now,
+                pools.get("prev_high"), pools.get("prev_low"),
+                nifty, vix,
+                prior_week_high=pools.get("prior_week_high"),
+                prior_week_low=pools.get("prior_week_low"),
+                prior_month_high=pools.get("prior_month_high"),
+                prior_month_low=pools.get("prior_month_low"),
+            )
             if result.get("verdict") == f"SETUP_{result.get('side')}":
                 idx_expiry = _pick_index_expiry(dh, sid, seg, day, OPTION_MIN_DTE_DAYS)
                 if not idx_expiry:
@@ -761,6 +845,7 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
                     chain = dh.option_chain(sid, idx_expiry, seg=seg)
                     result = attach_option_check(result, master, idx_expiry, chain, day=day)
             result["underlying_segment"] = seg
+            _fire_if_ready(result)
             results.append(result)
         except core.DhanAuthError:
             raise
@@ -778,7 +863,7 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
     snapshot = {
         "strategy": STRATEGY,
         "scan_time": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "expiry": expiry,
+        "expiry": stock_expiry,
         "candidates_checked": len(results),
         "nifty": nifty,
         "vix": vix,
@@ -791,38 +876,10 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
         for result in results:
             stream.write(json.dumps({"nifty_bias": nifty.get("bias"), **result}) + "\n")
 
-    buys = [r for r in results if r["verdict"].startswith("BUY_")]
-    buys.sort(
-        key=lambda r: (
-            float(((r.get("sweep") or {}).get("penetration_atr")) or 0),
-            float(((r.get("confirmation") or {}).get("body_atr_mult")) or 0),
-        ),
-        reverse=True,
-    )
-    if len(buys) > MAX_SIGNALS_PER_CYCLE:
-        for r in buys[MAX_SIGNALS_PER_CYCLE:]:
-            r["verdict"] = f"WATCH_{r['side']}"
-            r["fails"].append(f"exceeds MAX_SIGNALS_PER_CYCLE={MAX_SIGNALS_PER_CYCLE} this cycle")
-        buys = buys[:MAX_SIGNALS_PER_CYCLE]
-
-    signal_path = OUT / f"{STRATEGY}_signals_{day}.jsonl"
-    for result in buys:
-        key = f"{result['symbol']}_{result['side']}"
-        if key in fired:
-            # Another scanner already recommended this (symbol, side) today.
-            # Downgrade so record_buy_recommendations doesn't double-insert.
-            result["verdict"] = f"WATCH_{result['side']}"
-            result.setdefault("fails", []).append(
-                "already recommended today by another scanner (cross-strategy dedupe)"
-            )
-            continue
-        fired.add(key)
-        with open(signal_path, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps(result) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        notify_signal(result)
-
+    # File writes + Telegram happened INSIDE the loop (see _fire_if_ready above).
+    # Here we just emit the end-of-cycle summary. MAX_SIGNALS_PER_CYCLE is no
+    # longer applied as a cap - gates are strict enough that >2 simultaneous
+    # sweeps in one cycle is a strong signal and operator should see all.
     counts = {
         prefix: sum(r["verdict"].startswith(prefix) for r in results)
         for prefix in ("BUY_", "WATCH_", "SKIP")

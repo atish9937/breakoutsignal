@@ -488,6 +488,28 @@ def scan(dh, master, universe, exclude, expiry, day, now, fired):
     vix = _fetch_vix(dh, day)
     results = []
     frm = dt.datetime.combine(day - dt.timedelta(days=4), dt.time(9, 15), core.IST)
+    signal_path = OUT / f"trend_pullback_signals_{day}.jsonl"
+
+    def _fire_if_ready(result):
+        """Immediate dedupe + file-write + Telegram inside the per-symbol loop
+        so a BUY detected at symbol #3 doesn't wait for symbols #4-50 to finish
+        before the alert fires. Latency drops from ~15-30 sec to sub-second."""
+        if not result.get("verdict", "").startswith("BUY_"):
+            return
+        key = f"{result['symbol']}_{result['side']}"
+        if key in fired:
+            result["verdict"] = f"WATCH_{result['side']}"
+            result.setdefault("fails", []).append(
+                "already recommended today by another scanner (cross-strategy dedupe)"
+            )
+            return
+        fired.add(key)
+        with open(signal_path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(result) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        notify_signal(result)
+
     for symbol, sid in symbols.items():
         try:
             daily_ctx = _daily_context(dh, symbol, sid, day)
@@ -506,6 +528,7 @@ def scan(dh, master, universe, exclude, expiry, day, now, fired):
                 else:
                     chain = dh.option_chain(sid, expiry)
                     result = attach_option_check(result, master, expiry, chain, day=day)
+            _fire_if_ready(result)
             results.append(result)
         except core.DhanAuthError:
             raise
@@ -533,40 +556,9 @@ def scan(dh, master, universe, exclude, expiry, day, now, fired):
         for result in results:
             stream.write(json.dumps({"nifty_bias": nifty["bias"], **result}) + "\n")
 
-    buys = [result for result in results if result["verdict"].startswith("BUY_")]
-    buys.sort(
-        key=lambda r: (
-            float(((r.get("plan") or {}).get("runway_r")) or 0),
-            float(r.get("volume_ratio") or 0),
-        ),
-        reverse=True,
-    )
-    if len(buys) > MAX_SIGNALS_PER_CYCLE:
-        for result in buys[MAX_SIGNALS_PER_CYCLE:]:
-            result["verdict"] = f"WATCH_{result['side']}"
-            result["fails"].append(
-                f"exceeds MAX_SIGNALS_PER_CYCLE={MAX_SIGNALS_PER_CYCLE} this cycle"
-            )
-        buys = buys[:MAX_SIGNALS_PER_CYCLE]
-    signal_path = OUT / f"trend_pullback_signals_{day}.jsonl"
-    for result in buys:
-        key = f"{result['symbol']}_{result['side']}"
-        if key in fired:
-            # Another scanner already recommended this (symbol, side) today.
-            # Downgrade the verdict so record_buy_recommendations downstream
-            # doesn't insert this duplicate into paper_trades.
-            result["verdict"] = f"WATCH_{result['side']}"
-            result.setdefault("fails", []).append(
-                "already recommended today by another scanner (cross-strategy dedupe)"
-            )
-            continue
-        fired.add(key)
-        with open(signal_path, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps(result) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        notify_signal(result)
-
+    # File writes + Telegram happened INSIDE the loop (see _fire_if_ready above).
+    # Commit H dropped the MAX_SIGNALS_PER_CYCLE cap - with the tightened gate
+    # stack (Commits A-G) multi-fire cycles are rare and all deserve to surface.
     counts = {
         prefix: sum(result["verdict"].startswith(prefix) for result in results)
         for prefix in ("BUY_", "WATCH_", "SKIP")

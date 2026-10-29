@@ -95,6 +95,47 @@ class BreakoutConfigTests(unittest.TestCase):
         self.assertEqual(trend_pullback.MIN_T1_DISTANCE_PCT, 0.40)
 
 
+class PriorWeekAndMonthLevelsTests(unittest.TestCase):
+    """Commit H: liquidity_sweep now also considers prior week + prior month
+    highs/lows as liquidity pools (where swing-trader and institutional stops
+    accumulate)."""
+
+    def _daily_frame(self, start: str, periods: int, highs, lows):
+        import datetime as dt
+        idx = pd.date_range(start, periods=periods, freq="D",
+                            tz=dt.timezone(dt.timedelta(hours=5, minutes=30)))
+        return pd.DataFrame({
+            "open": lows, "high": highs, "low": lows,
+            "close": [(h + l) / 2 for h, l in zip(highs, lows)],
+            "volume": [0] * periods,
+        }, index=idx)
+
+    def test_prior_week_hl_returns_last_completed_week(self):
+        import datetime as dt
+        # 2026-10-30 is a Fri (ISO week 44). Prior week = 10-19 Mon .. 10-23 Fri (week 43).
+        # Build daily frame covering 10-19 .. 10-30.
+        daily = self._daily_frame("2026-10-19", 12,
+                                   highs=[100, 102, 108, 105, 110, 100, 100, 100, 100, 100, 100, 100],
+                                   lows=[90, 92, 93, 94, 95, 90, 90, 90, 90, 90, 90, 90])
+        today = dt.date(2026, 10, 30)
+        hi, lo = breakout_scanner.prior_week_high_low(daily, today)
+        # Week 43 was 2026-10-19 (Mon) through 2026-10-23 (Fri), 5 bars.
+        self.assertEqual(hi, 110)  # max of 100,102,108,105,110
+        self.assertEqual(lo, 90)   # min of 90,92,93,94,95
+
+    def test_prior_month_hl_returns_last_completed_calendar_month(self):
+        import datetime as dt
+        # Sep 2026 has highs up to 100; Oct starts with higher prints.
+        daily = self._daily_frame("2026-09-01", 42,
+                                   highs=[80 + i for i in range(30)] + [999] * 12,
+                                   lows=[70 + i for i in range(30)] + [0] * 12)
+        today = dt.date(2026, 10, 15)
+        hi, lo = breakout_scanner.prior_month_high_low(daily, today)
+        # Only Sep 2026 rows count: highs are 80..109, lows 70..99
+        self.assertEqual(hi, 109)
+        self.assertEqual(lo, 70)
+
+
 class StrikeWalkerTests(unittest.TestCase):
     """pick_option now exposes walk_candidates so evaluate() can scan OTM strikes."""
 

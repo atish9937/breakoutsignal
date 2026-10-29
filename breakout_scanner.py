@@ -537,6 +537,55 @@ def r2(x):
     return None if x is None or (isinstance(x, float) and math.isnan(x)) else round(float(x), 2)
 
 
+def prior_week_high_low(daily: pd.DataFrame, day: dt.date) -> tuple[float | None, float | None]:
+    """High/low of the prior ISO week (Mon-Fri before the week containing `day`).
+
+    Example: `day=2026-10-30` (Fri, ISO week 44) -> prior week = Mon 2026-10-19
+    through Fri 2026-10-23 (week 43). Returns (max(highs), min(lows)) of that
+    window.
+    """
+    if daily is None or daily.empty:
+        return None, None
+    try:
+        this_iso = day.isocalendar()
+    except AttributeError:
+        this_iso = dt.date(day.year, day.month, day.day).isocalendar()
+    this_year, this_week = this_iso[0], this_iso[1]
+    idx = daily.index.to_series()
+    iso = idx.dt.isocalendar()
+    this_week_rows = daily[(iso["year"] == this_year) & (iso["week"] == this_week)]
+    older = daily[daily.index < this_week_rows.index.min()] if len(this_week_rows) else daily
+    if older.empty:
+        return None, None
+    last_iso = older.index[-1].isocalendar()
+    last_year, last_week = last_iso[0], last_iso[1]
+    prior_week_rows = older[
+        (older.index.to_series().dt.isocalendar()["year"] == last_year)
+        & (older.index.to_series().dt.isocalendar()["week"] == last_week)
+    ]
+    if prior_week_rows.empty:
+        return None, None
+    return float(prior_week_rows["high"].max()), float(prior_week_rows["low"].min())
+
+
+def prior_month_high_low(daily: pd.DataFrame, day: dt.date) -> tuple[float | None, float | None]:
+    """High/low of the prior calendar month (full month before the month of `day`)."""
+    if daily is None or daily.empty:
+        return None, None
+    this_month = (day.year, day.month)
+    prior = daily[daily.index.to_series().apply(lambda t: (t.year, t.month) < this_month)]
+    if prior.empty:
+        return None, None
+    last_year = prior.index[-1].year
+    last_month = prior.index[-1].month
+    prior_month_rows = prior[
+        prior.index.to_series().apply(lambda t: t.year == last_year and t.month == last_month)
+    ]
+    if prior_month_rows.empty:
+        return None, None
+    return float(prior_month_rows["high"].max()), float(prior_month_rows["low"].min())
+
+
 # --------------------------------------------------------------------------------------
 # Lot sizes / option security ids from Dhan scrip master (cached daily)
 # --------------------------------------------------------------------------------------
@@ -757,6 +806,8 @@ def prepare(dh: Dhan, day: dt.date, symbols: dict) -> dict:
                 slot_avg = i5.groupby("slot")["volume"].mean().round(0).to_dict()
                 cum_avg = i5.groupby("slot")["cum"].mean().round(0).to_dict()
                 warm = i5["close"].tail(60).round(2).tolist()
+            pw_high, pw_low = prior_week_high_low(d, day)
+            pm_high, pm_low = prior_month_high_low(d, day)
             stocks[sym] = {
                 "sid": sid,
                 "atr": round(atr(d, CONFIG["atr_period"]), 2),
@@ -767,6 +818,9 @@ def prepare(dh: Dhan, day: dt.date, symbols: dict) -> dict:
                                      reverse=True),
                 "prev_high": float(d["high"].iloc[-1]), "prev_low": float(d["low"].iloc[-1]),
                 "prev_close": float(d["close"].iloc[-1]),
+                # Weekly / monthly liquidity pools for the sweep scanner
+                "prior_week_high": pw_high, "prior_week_low": pw_low,
+                "prior_month_high": pm_high, "prior_month_low": pm_low,
                 "sma20": round(float(d["close"].tail(20).mean()), 2),
                 "sma50": round(float(d["close"].tail(50).mean()), 2) if len(d) >= 50 else None,
                 "ema20": round(float(ema(d["close"], 20).iloc[-1]), 2),
@@ -1469,12 +1523,53 @@ def scan(dh, master, prep, day, exclude, fired, universe=None, ignore_entry_cuto
     pre.sort()
     pre = pre[: CONFIG["max_candidates_per_scan"]]
 
+    scan_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    signal_path = OUT / f"signals_{day}.jsonl"
+    new_signals: list[dict] = []
+
+    def _fire_if_ready(r: dict) -> None:
+        """Immediate dedupe + file-write + Telegram inside the per-candidate loop
+        so a BUY detected at the 3rd candidate doesn't wait for candidates 4-25
+        (each potentially 3+ seconds for the option chain call) before alerting.
+        Latency drops from ~15-75 sec to sub-second after evaluation completes.
+        """
+        if not r["verdict"].startswith("BUY"):
+            return
+        key = f"{r['symbol']}_{r['side']}"
+        if key in fired:
+            r["verdict"] = f"WATCH_{r['side']}"
+            r.setdefault("fails", []).append(
+                "already recommended today by another scanner (cross-strategy dedupe)"
+            )
+            return
+        fired.add(key)
+        new_signals.append(r)
+        order_state = {"status": "DISABLED"}
+        if live_orders_enabled:
+            order_state = {"status": "ARMED"}
+        signal = {"type": "SIGNAL", "scan_time": scan_time_str, "nifty": nifty,
+                  "execution": order_state, **r}
+        with open(signal_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(signal) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        print("\n=========== RECOMMENDATION FOR AI VALIDATION (copy from here) ===========")
+        print(json.dumps(signal, indent=2))
+        print("=========== END RECOMMENDATION - script says BUY, AI must validate it ===========\n")
+        if live_orders_enabled:
+            order_state_live = submit_live_order(dh, r, day)
+            notify(r, order_state_live)
+        else:
+            notify(r, order_state)
+
     results = []
     for _, s, side, q in pre:
         try:
-            results.append(evaluate(dh, master, prep, s, side, q, nifty, now, day,
-                                   ignore_entry_cutoff=ignore_entry_cutoff,
-                                   breadth=breadth, vix=vix))
+            r = evaluate(dh, master, prep, s, side, q, nifty, now, day,
+                         ignore_entry_cutoff=ignore_entry_cutoff,
+                         breadth=breadth, vix=vix)
+            _fire_if_ready(r)
+            results.append(r)
         except DhanAuthError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -1483,7 +1578,7 @@ def scan(dh, master, prep, day, exclude, fired, universe=None, ignore_entry_cuto
 
     order = {"BUY": 0, "WATCH": 1, "SKIP": 2}
     results.sort(key=lambda r: order.get(r["verdict"].split("_")[0], 3))
-    snapshot = {"scan_time": now.strftime("%Y-%m-%d %H:%M:%S"), "nifty": nifty,
+    snapshot = {"scan_time": scan_time_str, "nifty": nifty,
                 "expiry": prep.get("expiry"), "candidates_checked": len(results), "results": results}
 
     OUT.mkdir(exist_ok=True)
@@ -1493,37 +1588,6 @@ def scan(dh, master, prep, day, exclude, fired, universe=None, ignore_entry_cuto
             f.write(json.dumps({"nifty_bias": nifty["bias"], **r}) + "\n")
 
     print_scan(snapshot)
-    new_signals = []
-    for r in results:
-        key = f"{r['symbol']}_{r['side']}"
-        if not r["verdict"].startswith("BUY"):
-            continue
-        if key in fired:
-            # Another scanner (or an earlier cycle today) already recommended
-            # this (symbol, side). Downgrade the verdict so downstream
-            # record_buy_recommendations doesn't double-insert into paper_trades.
-            r["verdict"] = f"WATCH_{r['side']}"
-            r.setdefault("fails", []).append(
-                "already recommended today by another scanner (cross-strategy dedupe)"
-            )
-            continue
-        fired.add(key)
-        new_signals.append(r)
-        order_state = {"status": "DISABLED"}
-        if live_orders_enabled:
-            order_state = {"status": "ARMED"}
-        signal = {"type": "SIGNAL", "scan_time": snapshot["scan_time"], "nifty": nifty,
-                  "execution": order_state, **r}
-        with open(OUT / f"signals_{day}.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps(signal) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        print("\n=========== RECOMMENDATION FOR AI VALIDATION (copy from here) ===========")
-        print(json.dumps(signal, indent=2))
-        print("=========== END RECOMMENDATION - script says BUY, AI must validate it ===========\n")
-        if live_orders_enabled:
-            order_state = submit_live_order(dh, r, day)
-        notify(r, order_state)
     if new_signals:
         # One batch per scan, every new recommendation together, so the cross-recommendation
         # correlation and regime checks in "ai_validation" actually have something to compare.
