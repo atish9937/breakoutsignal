@@ -252,7 +252,10 @@ WATCHLIST = {
 }
 
 # Used only if the Dhan scrip master can't be downloaded. Verify on Dhan before trading.
-LOT_FALLBACK = {"JSWSTEEL": 675, "SHRIRAMFIN": 825, "VEDL": 1150, "HDFCBANK": 550}
+LOT_FALLBACK = {
+    "JSWSTEEL": 675, "SHRIRAMFIN": 825, "VEDL": 1150, "HDFCBANK": 550,
+    "NIFTY": 25, "BANKNIFTY": 15,  # index options
+}
 
 NIFTY_ID = 13  # IDX_I
 INDIA_VIX_ID = 21  # IDX_I - override via env if Dhan changes the id
@@ -533,8 +536,12 @@ def r2(x):
 # --------------------------------------------------------------------------------------
 def load_master(day: dt.date) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     """Dhan scrip master, cached daily as two small files:
-    eq_<day>.csv     NSE cash-market equities (symbol -> securityId)
-    optstk_<day>.csv NSE stock options (lot size, option securityId)"""
+    eq_<day>.csv       NSE cash-market equities (symbol -> securityId)
+    optstk_<day>.csv   NSE stock options + index options concatenated
+                       (lot size, option securityId). Stock options have
+                       UNDERLYING = stock symbol (e.g. RELIANCE); index
+                       options have UNDERLYING = NIFTY / BANKNIFTY so the
+                       same lot_and_id() path serves both."""
     eq_path, opt_path = OUT / f"eq_{day}.csv", OUT / f"optstk_{day}.csv"
     if eq_path.exists() and opt_path.exists():
         return pd.read_csv(eq_path), pd.read_csv(opt_path)
@@ -546,11 +553,15 @@ def load_master(day: dt.date) -> tuple[pd.DataFrame | None, pd.DataFrame | None]
         eq = eq[["SEM_SMST_SECURITY_ID", "SEM_TRADING_SYMBOL"]].rename(
             columns={"SEM_SMST_SECURITY_ID": "SID", "SEM_TRADING_SYMBOL": "SYMBOL"})
         eq["SYMBOL"] = eq["SYMBOL"].astype(str).str.strip().str.upper()
-        opt = nse[nse["SEM_INSTRUMENT_NAME"] == "OPTSTK"]
-        opt = opt[["SEM_SMST_SECURITY_ID", "SEM_TRADING_SYMBOL", "SEM_LOT_UNITS", "SEM_EXPIRY_DATE",
-                   "SEM_STRIKE_PRICE", "SEM_OPTION_TYPE"]].copy()
-        opt["UNDERLYING"] = opt["SEM_TRADING_SYMBOL"].astype(str).str.split("-").str[0].str.upper()
-        opt["EXPIRY"] = opt["SEM_EXPIRY_DATE"].astype(str).str[:10]
+        option_cols = ["SEM_SMST_SECURITY_ID", "SEM_TRADING_SYMBOL", "SEM_LOT_UNITS",
+                       "SEM_EXPIRY_DATE", "SEM_STRIKE_PRICE", "SEM_OPTION_TYPE"]
+        opt_stk = nse[nse["SEM_INSTRUMENT_NAME"] == "OPTSTK"][option_cols].copy()
+        opt_stk["UNDERLYING"] = opt_stk["SEM_TRADING_SYMBOL"].astype(str).str.split("-").str[0].str.upper()
+        opt_stk["EXPIRY"] = opt_stk["SEM_EXPIRY_DATE"].astype(str).str[:10]
+        opt_idx = nse[nse["SEM_INSTRUMENT_NAME"] == "OPTIDX"][option_cols].copy()
+        opt_idx["UNDERLYING"] = opt_idx["SEM_TRADING_SYMBOL"].astype(str).str.split("-").str[0].str.upper()
+        opt_idx["EXPIRY"] = opt_idx["SEM_EXPIRY_DATE"].astype(str).str[:10]
+        opt = pd.concat([opt_stk, opt_idx], ignore_index=True)
         OUT.mkdir(exist_ok=True)
         eq.to_csv(eq_path, index=False)
         opt.to_csv(opt_path, index=False)

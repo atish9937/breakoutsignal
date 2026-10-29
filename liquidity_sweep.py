@@ -88,6 +88,15 @@ OPTION_DELTA_FALLBACK = 0.5
 
 VIX_SPIKE_MULTIPLIER = 1.30
 
+# Index underlyings scanned alongside the stock universe. "underlying_seg" is
+# the Dhan segment for the index itself (IDX_I); "option_seg" is the segment
+# the options sit on (NSE_FNO for NSE indices). Sensex / BankEx require the
+# BSE scrip master and are deferred to a follow-up commit.
+INDICES = {
+    "NIFTY":     {"sid": 13, "underlying_seg": "IDX_I", "option_seg": "NSE_FNO"},
+    "BANKNIFTY": {"sid": 25, "underlying_seg": "IDX_I", "option_seg": "NSE_FNO"},
+}
+
 OUT = core.OUT
 
 
@@ -627,20 +636,56 @@ def _fetch_vix(dh, day):
     }
 
 
+def _index_prev_high_low(dh, sid: int, seg: str, day: dt.date) -> tuple[float | None, float | None]:
+    """Fetch yesterday's completed-session high/low for an index."""
+    try:
+        daily = dh.daily(sid, seg=seg, inst="INDEX", days=5)
+    except Exception:  # noqa: BLE001
+        return None, None
+    if daily is None or daily.empty:
+        return None, None
+    prior = daily[daily.index.date < day]
+    if prior.empty:
+        return None, None
+    return float(prior["high"].iloc[-1]), float(prior["low"].iloc[-1])
+
+
+def _pick_index_expiry(dh, sid: int, seg: str, day: dt.date,
+                       min_dte_days: int) -> str | None:
+    """Pick the nearest index expiry at least `min_dte_days` out (weekly for Nifty/BN)."""
+    try:
+        expiries = dh.expiries(sid, seg=seg)
+    except Exception:  # noqa: BLE001
+        return None
+    future = []
+    for raw in expiries or []:
+        try:
+            exp_date = dt.date.fromisoformat(str(raw)[:10])
+        except (TypeError, ValueError):
+            continue
+        if (exp_date - day).days >= min_dte_days:
+            future.append(str(raw)[:10])
+    return min(future) if future else None
+
+
 def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
          now: dt.datetime, fired: set[str]) -> dict:
     """One scan cycle. Only fires on the 5-minute boundary; the main runner
     schedules five-minute wake-ups so the second-to-last bar is a candidate
-    sweep and the last bar is the confirmation."""
+    sweep and the last bar is the confirmation.
+
+    Scans the full equity universe PLUS the configured INDICES (Nifty, BankNifty).
+    """
     quotes = dh.ohlc({"NSE_EQ": list(universe.values()), "IDX_I": [core.NIFTY_ID]})
     nifty = core.nifty_bias(dh, quotes, day, now)
     vix = _fetch_vix(dh, day)
-    expiry = prep.get("expiry")
+    stock_expiry = prep.get("expiry")
     frm = dt.datetime.combine(day - dt.timedelta(days=4), dt.time(9, 15), core.IST)
 
     results: list[dict] = []
     stocks = prep.get("stocks") or {}
 
+    # ---- Equity universe -----------------------------------------------------
     for symbol, sid in universe.items():
         try:
             candles = dh.intraday(sid, frm, now)
@@ -650,14 +695,14 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
             prev_low = prep_entry.get("prev_low")
             result = evaluate_setup(symbol, candles, now, prev_high, prev_low, nifty, vix)
             if result.get("verdict") == f"SETUP_{result.get('side')}":
-                if not expiry:
+                if not stock_expiry:
                     _record(result["mechanical_checks"], "Option expiry",
                             "unavailable", "valid expiry available", False)
                     result["fails"].append("option expiry unavailable")
                     result["verdict"] = f"WATCH_{result['side']}"
                 else:
-                    chain = dh.option_chain(sid, expiry)
-                    result = attach_option_check(result, master, expiry, chain, day=day)
+                    chain = dh.option_chain(sid, stock_expiry)
+                    result = attach_option_check(result, master, stock_expiry, chain, day=day)
             results.append(result)
         except core.DhanAuthError:
             raise
@@ -669,6 +714,40 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
                 "verdict": "SKIP",
                 "fails": [f"{type(exc).__name__}: {exc}"],
                 "mechanical_checks": [],
+            })
+
+    # ---- Index universe (Nifty 50, Bank Nifty) ------------------------------
+    for index_name, cfg in INDICES.items():
+        sid = cfg["sid"]
+        seg = cfg["underlying_seg"]
+        try:
+            prev_high, prev_low = _index_prev_high_low(dh, sid, seg, day)
+            candles = dh.intraday(sid, frm, now, seg=seg, inst="INDEX")
+            candles = candles[candles.index <= pd.Timestamp(now) - pd.Timedelta(minutes=5)]
+            result = evaluate_setup(index_name, candles, now, prev_high, prev_low, nifty, vix)
+            if result.get("verdict") == f"SETUP_{result.get('side')}":
+                idx_expiry = _pick_index_expiry(dh, sid, seg, day, OPTION_MIN_DTE_DAYS)
+                if not idx_expiry:
+                    _record(result["mechanical_checks"], "Option expiry",
+                            "no expiry at DTE threshold", "valid expiry available", False)
+                    result["fails"].append("index option expiry unavailable")
+                    result["verdict"] = f"WATCH_{result['side']}"
+                else:
+                    chain = dh.option_chain(sid, idx_expiry, seg=seg)
+                    result = attach_option_check(result, master, idx_expiry, chain, day=day)
+            result["underlying_segment"] = seg
+            results.append(result)
+        except core.DhanAuthError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            results.append({
+                "strategy": STRATEGY,
+                "symbol": index_name,
+                "side": None,
+                "verdict": "SKIP",
+                "fails": [f"{type(exc).__name__}: {exc}"],
+                "mechanical_checks": [],
+                "underlying_segment": seg,
             })
 
     snapshot = {

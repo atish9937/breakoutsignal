@@ -252,5 +252,56 @@ class ConfigConsistencyTests(unittest.TestCase):
         self.assertEqual(strategy.MIN_ADX, 20.0)
 
 
+class IndexSupportTests(unittest.TestCase):
+    """Commit D: NIFTY + BANKNIFTY are scanned alongside the stock universe."""
+
+    def test_indices_config_contains_nifty_and_banknifty_on_idx_i(self):
+        self.assertIn("NIFTY", strategy.INDICES)
+        self.assertIn("BANKNIFTY", strategy.INDICES)
+        self.assertEqual(strategy.INDICES["NIFTY"]["sid"], 13)
+        self.assertEqual(strategy.INDICES["NIFTY"]["underlying_seg"], "IDX_I")
+        self.assertEqual(strategy.INDICES["BANKNIFTY"]["sid"], 25)
+        self.assertEqual(strategy.INDICES["BANKNIFTY"]["underlying_seg"], "IDX_I")
+
+    def test_pick_index_expiry_filters_by_min_dte(self):
+        class _DhStub:
+            def expiries(self, sid, seg="NSE_EQ"):
+                return ["2026-10-30", "2026-11-06", "2026-11-13", "2026-11-27"]
+        day = dt.date(2026, 10, 29)
+        # with min_dte=5 we need expiry >= 2026-11-03
+        picked = strategy._pick_index_expiry(_DhStub(), 13, "IDX_I", day, 5)
+        self.assertEqual(picked, "2026-11-06")
+
+    def test_pick_index_expiry_returns_none_when_no_expiry_fits_dte_floor(self):
+        class _DhStub:
+            def expiries(self, sid, seg="NSE_EQ"):
+                return ["2026-10-30"]  # too close
+        day = dt.date(2026, 10, 29)
+        self.assertIsNone(strategy._pick_index_expiry(_DhStub(), 13, "IDX_I", day, 5))
+
+    def test_index_prev_high_low_returns_prior_session_only(self):
+        """Should not use TODAY's partial high/low as the prev-day reference."""
+        day = dt.date(2026, 10, 29)
+        idx = pd.date_range("2026-10-27", periods=3, freq="D", tz=IST)
+        daily = pd.DataFrame(
+            {"open": [100]*3, "high": [110, 115, 120], "low": [95, 93, 97],
+             "close": [105, 108, 112], "volume": [0]*3},
+            index=idx,
+        )
+
+        class _DhStub:
+            def daily(self, sid, seg, inst, days):
+                return daily
+        prev_high, prev_low = strategy._index_prev_high_low(_DhStub(), 13, "IDX_I", day)
+        # 10-29 is "today"; the prior session is 10-28 (idx[-2] = Oct 28)
+        self.assertEqual(prev_high, 115)
+        self.assertEqual(prev_low, 93)
+
+    def test_core_lot_fallback_covers_indices(self):
+        """Ensures lot_and_id falls back gracefully for NIFTY/BANKNIFTY."""
+        self.assertEqual(core.LOT_FALLBACK.get("NIFTY"), 25)
+        self.assertEqual(core.LOT_FALLBACK.get("BANKNIFTY"), 15)
+
+
 if __name__ == "__main__":
     unittest.main()
