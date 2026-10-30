@@ -17,7 +17,7 @@ import requests
 import option_positions
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 ACTIVE_STATUSES = ("tracking", "t1_hit")
 WIN_STATUSES = ("t1_hit", "t2_hit", "t1_then_breakeven")
 RESOLVED_STATUSES = (*WIN_STATUSES, "stop_before_t1")
@@ -39,7 +39,7 @@ def connect(database: Path) -> sqlite3.Connection:
         );
         CREATE TABLE IF NOT EXISTS paper_trades (
             id INTEGER PRIMARY KEY,
-            strategy TEXT NOT NULL CHECK (strategy IN ('breakout', 'trend_pullback')),
+            strategy TEXT NOT NULL CHECK (strategy IN ('breakout', 'trend_pullback', 'liquidity_sweep')),
             session_date TEXT NOT NULL,
             symbol TEXT NOT NULL,
             side TEXT NOT NULL CHECK (side IN ('CE', 'PE')),
@@ -191,6 +191,80 @@ def connect(database: Path) -> sqlite3.Connection:
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)",
         (now,),
     )
+
+    # Migration v6: widen the strategy CHECK constraint to include
+    # 'liquidity_sweep'. SQLite can't ALTER a CHECK in place, so we rebuild
+    # paper_trades by creating a new table, copying data, dropping old,
+    # renaming new. Only runs once per database (gated on the migrations row).
+    already_at_v6 = connection.execute(
+        "SELECT 1 FROM schema_migrations WHERE version >= 6"
+    ).fetchone()
+    if not already_at_v6:
+        # Discover what the current strategy CHECK looks like before rebuilding
+        current_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='paper_trades'"
+        ).fetchone()
+        if current_sql and "'liquidity_sweep'" not in (current_sql[0] or ""):
+            # Capture current columns so the copy preserves everything through
+            # ALTER-added columns (option_security_id, entry_at, etc.)
+            existing_cols = [
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(paper_trades)"
+                ).fetchall()
+            ]
+            col_list = ", ".join(existing_cols)
+            connection.executescript(
+                """
+                CREATE TABLE paper_trades_v6 (
+                    id INTEGER PRIMARY KEY,
+                    strategy TEXT NOT NULL CHECK (strategy IN ('breakout', 'trend_pullback', 'liquidity_sweep')),
+                    session_date TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL CHECK (side IN ('CE', 'PE')),
+                    security_id INTEGER NOT NULL CHECK (security_id > 0),
+                    signal_time TEXT NOT NULL,
+                    entry_at TEXT,
+                    reference_entry REAL NOT NULL,
+                    stop_price REAL NOT NULL,
+                    target_1 REAL NOT NULL,
+                    target_2 REAL NOT NULL,
+                    last_price REAL,
+                    option_security_id INTEGER,
+                    option_expiry TEXT,
+                    option_instrument TEXT NOT NULL DEFAULT 'OPTSTK',
+                    option_segment TEXT NOT NULL DEFAULT 'NSE_FNO',
+                    option_entry_ltp REAL,
+                    option_entry_bid REAL,
+                    option_entry_ask REAL,
+                    option_lot_size INTEGER,
+                    signal_json TEXT,
+                    data_capture_error TEXT,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('tracking', 'stop_before_t1', 't1_hit', 't2_hit',
+                                   't1_then_breakeven', 'unresolved')
+                    ),
+                    target_1_at TEXT,
+                    target_2_at TEXT,
+                    stop_at TEXT,
+                    last_candle_at TEXT,
+                    tracking_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (strategy, session_date, symbol, side)
+                );
+                """
+            )
+            connection.execute(
+                f"INSERT INTO paper_trades_v6 ({col_list}) SELECT {col_list} FROM paper_trades"
+            )
+            connection.executescript(
+                """
+                DROP TABLE paper_trades;
+                ALTER TABLE paper_trades_v6 RENAME TO paper_trades;
+                """
+            )
+
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
         (SCHEMA_VERSION, now),
@@ -239,7 +313,9 @@ def record_buy_recommendations(
             continue
         symbol = result.get("symbol")
         plan = result.get("plan") or {}
-        security_id = universe.get(symbol)
+        # For index results (NIFTY, BANKNIFTY in liquidity_sweep) the sid is on
+        # the result itself since they aren't in the equity universe dict.
+        security_id = result.get("underlying_security_id") or universe.get(symbol)
         entry = _as_number(plan.get("entry", result.get("ltp")))
         stop = _as_number(plan.get("stop"))
         target_1 = _as_number(plan.get("t1"))

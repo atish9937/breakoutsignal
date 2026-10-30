@@ -1131,14 +1131,22 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
     # barely above the 55 floor) but MACD histogram -0.32 (negative). Hard gate
     # now requires MACD sign to agree with trade direction.
     if CONFIG.get("require_macd_momentum", True):
-        macd_ok = (mh > 0) if side == "CE" else (mh < 0)
+        mh_is_nan = isinstance(mh, float) and math.isnan(mh)
+        if mh_is_nan:
+            macd_ok = False
+            macd_current = "histogram unavailable (insufficient close history)"
+            macd_note = "macd hist n/a"
+        else:
+            macd_ok = (mh > 0) if side == "CE" else (mh < 0)
+            macd_current = f"histogram {mh:+.3f}"
+            macd_note = f"macd hist {mh:+.3f}"
         record_check(
             "MACD momentum",
-            f"histogram {mh:+.3f}",
+            macd_current,
             "> 0 for CE / < 0 for PE",
             macd_ok,
         )
-        (passes if macd_ok else fails).append(f"macd hist {mh:+.3f}")
+        (passes if macd_ok else fails).append(macd_note)
     else:
         macd_ok = True
 
@@ -1532,6 +1540,9 @@ def scan(dh, master, prep, day, exclude, fired, universe=None, ignore_entry_cuto
         so a BUY detected at the 3rd candidate doesn't wait for candidates 4-25
         (each potentially 3+ seconds for the option chain call) before alerting.
         Latency drops from ~15-75 sec to sub-second after evaluation completes.
+
+        Order: file-write first, then fired.add + append-to-batch, then notify.
+        Protects against notify crashing after fired.add (would orphan a BUY).
         """
         if not r["verdict"].startswith("BUY"):
             return
@@ -1542,25 +1553,32 @@ def scan(dh, master, prep, day, exclude, fired, universe=None, ignore_entry_cuto
                 "already recommended today by another scanner (cross-strategy dedupe)"
             )
             return
-        fired.add(key)
-        new_signals.append(r)
         order_state = {"status": "DISABLED"}
         if live_orders_enabled:
             order_state = {"status": "ARMED"}
         signal = {"type": "SIGNAL", "scan_time": scan_time_str, "nifty": nifty,
                   "execution": order_state, **r}
-        with open(signal_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(signal) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        try:
+            with open(signal_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(signal) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError as exc:
+            print(f"breakout signal file write failed: {exc}", file=sys.stderr)
+            return
+        fired.add(key)
+        new_signals.append(r)
         print("\n=========== RECOMMENDATION FOR AI VALIDATION (copy from here) ===========")
         print(json.dumps(signal, indent=2))
         print("=========== END RECOMMENDATION - script says BUY, AI must validate it ===========\n")
-        if live_orders_enabled:
-            order_state_live = submit_live_order(dh, r, day)
-            notify(r, order_state_live)
-        else:
-            notify(r, order_state)
+        try:
+            if live_orders_enabled:
+                order_state_live = submit_live_order(dh, r, day)
+                notify(r, order_state_live)
+            else:
+                notify(r, order_state)
+        except Exception as exc:  # noqa: BLE001
+            print(f"breakout Telegram notify failed: {exc}", file=sys.stderr)
 
     results = []
     for _, s, side, q in pre:

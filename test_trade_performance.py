@@ -350,6 +350,36 @@ class TradePerformanceTests(unittest.TestCase):
         )
         self.assertNotIn("Live quote feed DOWN", report)
 
+    def test_record_buy_falls_back_to_result_underlying_security_id(self):
+        """Commit I CRITICAL 1 fix: index symbols (NIFTY/BANKNIFTY) are not in
+        the equity universe dict, so record_buy_recommendations must pick up
+        the security_id from result['underlying_security_id'] when the universe
+        lookup misses. Without this fix, every index liquidity_sweep BUY would
+        be silently rejected by the ledger."""
+        snapshot = {
+            "scan_time": "2026-10-21 10:15:20",
+            "results": [{
+                "verdict": "BUY_PE",
+                "symbol": "NIFTY",
+                "side": "PE",
+                "underlying_security_id": 13,  # NIFTY on IDX_I
+                "ltp": 22840,
+                "plan": {"entry": 22840, "stop": 22895, "t1": 22780, "t2": 22720},
+                "option": {"security_id": 999, "expiry": "2026-11-06", "premium": 145},
+            }],
+        }
+        inserted = performance.record_buy_recommendations(
+            self.connection, "liquidity_sweep", snapshot,
+            universe={},  # NIFTY is NOT in universe
+            session_date=SESSION,
+        )
+        self.assertEqual(inserted, 1)
+        row = self.connection.execute(
+            "SELECT symbol, side, security_id FROM paper_trades WHERE strategy='liquidity_sweep'"
+        ).fetchone()
+        self.assertEqual(row["symbol"], "NIFTY")
+        self.assertEqual(row["security_id"], 13)
+
 
 if __name__ == "__main__":
     unittest.main()

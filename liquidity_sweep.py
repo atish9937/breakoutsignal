@@ -448,16 +448,33 @@ def evaluate_setup(symbol: str, candles: pd.DataFrame, now: dt.datetime,
     t1 = entry + sign * T1_R * risk
     t2 = entry + sign * T2_R * risk
 
-    # Cap targets at the opposite-side pool, if closer
+    # Cap targets at the opposite-side pool when it sits inside the raw target.
+    # Must preserve ordering (entry < t1 <= t2 for CE; entry > t1 >= t2 for PE)
+    # or the ledger insert in record_buy_recommendations rejects the record.
     opposite_pool = (_nearest_pool_above(pool_highs, entry) if side == "CE"
                      else _nearest_pool_below(pool_lows, entry))
     if opposite_pool is not None:
         if side == "CE":
             t2 = min(t2, opposite_pool)
-            t1 = min(t1, t2 - 0.5 * risk) if t2 > t1 else t1
+            if t1 >= t2:
+                # Cap compressed T2 below the un-capped T1 - place T1 at 60% of
+                # the entry-to-T2 distance so entry < t1 < t2 is preserved.
+                t1 = entry + 0.6 * (t2 - entry)
         else:
             t2 = max(t2, opposite_pool)
-            t1 = max(t1, t2 + 0.5 * risk) if t2 < t1 else t1
+            if t1 <= t2:
+                t1 = entry + 0.6 * (t2 - entry)
+    # Final sanity: if the cap made T1-T2 collapse too tightly, drop the signal
+    # rather than ship an un-tradeable R:R.
+    min_t_gap = 0.1 * risk
+    if abs(t2 - t1) < min_t_gap:
+        _record(checks, "Target spacing",
+                f"T1 {t1:.2f} and T2 {t2:.2f} too close after opposite-pool cap",
+                f">= {min_t_gap:.3f} points apart", False)
+        result["side"] = side
+        result["verdict"] = f"WATCH_{side}"
+        result["fails"].append("targets collapsed by opposite-pool cap")
+        return result
 
     result.update({
         "side": side,
@@ -762,6 +779,11 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
         """Immediate dedupe + file-write + Telegram when a BUY is confirmed.
         Called inside the per-symbol loop so Telegram arrives sub-second after
         the gates pass, not after the whole 50-symbol scan completes.
+
+        Order matters: file-write first, then fired.add, then notify. If the
+        notify POST crashes, we still have the signal row + dedupe (no re-fire
+        next cycle). If the file write fails, we don't add to fired (next
+        cycle retries).
         """
         if not result.get("verdict", "").startswith("BUY_"):
             return
@@ -772,12 +794,19 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
                 "already recommended today by another scanner (cross-strategy dedupe)"
             )
             return
+        try:
+            with open(signal_path, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(result) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as exc:
+            print(f"liquidity_sweep signal file write failed: {exc}", file=sys.stderr)
+            return
         fired.add(key)
-        with open(signal_path, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps(result) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        notify_signal(result)
+        try:
+            notify_signal(result)
+        except Exception as exc:  # noqa: BLE001
+            print(f"liquidity_sweep Telegram notify failed: {exc}", file=sys.stderr)
 
     # ---- Equity universe -----------------------------------------------------
     for symbol, sid in universe.items():
@@ -845,6 +874,10 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
                     chain = dh.option_chain(sid, idx_expiry, seg=seg)
                     result = attach_option_check(result, master, idx_expiry, chain, day=day)
             result["underlying_segment"] = seg
+            # Index symbols aren't in the equity `universe` dict passed to
+            # record_buy_recommendations, so expose the sid on the result for
+            # the ledger insert to find.
+            result["underlying_security_id"] = sid
             _fire_if_ready(result)
             results.append(result)
         except core.DhanAuthError:

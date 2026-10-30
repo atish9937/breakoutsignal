@@ -311,6 +311,51 @@ class IndexSupportTests(unittest.TestCase):
         self.assertEqual(core.LOT_FALLBACK.get("NIFTY"), 25)
         self.assertEqual(core.LOT_FALLBACK.get("BANKNIFTY"), 15)
 
+    def test_opposite_pool_cap_preserves_t1_before_t2_ordering(self):
+        """Commit I CRITICAL 2 fix: when the opposite liquidity pool caps T2
+        below the un-capped T1, the code must pull T1 inside T2 (not leave
+        t1 > t2 for CE / t1 < t2 for PE). Previously the ledger insert in
+        record_buy_recommendations silently rejected such mis-ordered records
+        AFTER Telegram had already fired."""
+        # Build a CE setup where the opposite_pool_high is 101 (very close to
+        # entry) so the opposite_pool cap on T2 compresses it below the raw T1.
+        # Verify the final plan satisfies entry < t1 < t2 for CE.
+        import math
+        import numpy as np
+        from unittest.mock import patch
+        candles = _flat_bars(30)
+        candles["volume"] = 1000
+        # Make bar 10 a swing low pivot at 94.0 and bar 20 a nearby pool-high at 101.0
+        candles.loc[candles.index[10], "low"] = 94.0
+        candles.loc[candles.index[20], "high"] = 101.0
+        # Sweep bar: pokes below pivot_low 94.0, closes back above - a bullish sweep
+        sweep_idx = candles.index[-2]
+        confirm_idx = candles.index[-1]
+        candles.loc[sweep_idx, ["open", "high", "low", "close", "volume"]] = [
+            95.0, 95.5, 93.5, 95.0, 2000
+        ]
+        candles.loc[confirm_idx, ["open", "high", "low", "close", "volume"]] = [
+            95.0, 96.5, 95.0, 96.4, 2000
+        ]
+        now = confirm_idx.to_pydatetime() + dt.timedelta(seconds=20)
+        with patch.object(core, "atr", return_value=1.0), \
+                patch.object(core, "adx", return_value=25.0):
+            result = strategy.evaluate_setup(
+                "TEST", candles, now,
+                prev_high=None, prev_low=94.0,
+                nifty_bias={"bias": "UP"},
+                vix={"ltp": 15.0, "ema20": 15.0},
+            )
+        # If the fix is in: either SETUP_CE with t1 < t2, or WATCH with
+        # "targets collapsed" fail reason. Must NOT be SETUP_CE with t1 > t2.
+        if result["verdict"] == "SETUP_CE":
+            plan = result["plan"]
+            self.assertLess(plan["entry"], plan["t1"], f"entry >= t1 in {plan}")
+            self.assertLess(plan["t1"], plan["t2"], f"t1 >= t2 in {plan}")
+        else:
+            # Acceptable alternative: scanner refuses the signal
+            self.assertEqual(result["verdict"], "WATCH_CE")
+
     def test_index_prev_high_low_caches_per_day(self):
         """A 60-cycle session must only hit dh.daily once per index per day."""
         day = dt.date(2026, 10, 29)

@@ -493,7 +493,12 @@ def scan(dh, master, universe, exclude, expiry, day, now, fired):
     def _fire_if_ready(result):
         """Immediate dedupe + file-write + Telegram inside the per-symbol loop
         so a BUY detected at symbol #3 doesn't wait for symbols #4-50 to finish
-        before the alert fires. Latency drops from ~15-30 sec to sub-second."""
+        before the alert fires. Latency drops from ~15-30 sec to sub-second.
+
+        Order: file-write first, then fired.add, then notify. If notify POST
+        crashes we keep the signal row + dedupe. If file write fails, don't
+        dedupe so next cycle can retry.
+        """
         if not result.get("verdict", "").startswith("BUY_"):
             return
         key = f"{result['symbol']}_{result['side']}"
@@ -503,12 +508,19 @@ def scan(dh, master, universe, exclude, expiry, day, now, fired):
                 "already recommended today by another scanner (cross-strategy dedupe)"
             )
             return
+        try:
+            with open(signal_path, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(result) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as exc:
+            print(f"trend_pullback signal file write failed: {exc}", file=sys.stderr)
+            return
         fired.add(key)
-        with open(signal_path, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps(result) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        notify_signal(result)
+        try:
+            notify_signal(result)
+        except Exception as exc:  # noqa: BLE001
+            print(f"trend_pullback Telegram notify failed: {exc}", file=sys.stderr)
 
     for symbol, sid in symbols.items():
         try:

@@ -60,25 +60,40 @@ _daily_cache: dict[tuple[int, str], pd.DataFrame] = {}
 
 def prev_day_high_low(dh, sid: int, seg: str, inst: str,
                       day: dt.date) -> tuple[float | None, float | None]:
-    """Pull daily history once per symbol; derive prev-session H/L per target day."""
+    """Back-compat shim: returns just prev-session H/L. Prefer `all_pools`."""
+    pools = all_pools(dh, sid, seg, inst, day)
+    return pools.get("prev_high"), pools.get("prev_low")
+
+
+def all_pools(dh, sid: int, seg: str, inst: str, day: dt.date) -> dict:
+    """Pull daily history once per symbol; derive prev-session H/L, prior-week
+    H/L and prior-month H/L (same pools the live liquidity_sweep uses after
+    Commit H). Cached per (sid, seg)."""
     cache_key = (sid, seg)
     if cache_key not in _daily_cache:
         try:
             if seg == "IDX_I":
-                df = dh.daily(sid, seg=seg, inst=inst, days=30)
+                df = dh.daily(sid, seg=seg, inst=inst, days=60)
             else:
-                df = dh.daily(sid, days=30)
+                df = dh.daily(sid, days=60)
         except Exception:  # noqa: BLE001
             _daily_cache[cache_key] = pd.DataFrame()
-            return None, None
+            return {}
         _daily_cache[cache_key] = df if df is not None else pd.DataFrame()
     df = _daily_cache[cache_key]
     if df.empty:
-        return None, None
+        return {}
     prior = df[df.index.date < day]
     if prior.empty:
-        return None, None
-    return float(prior["high"].iloc[-1]), float(prior["low"].iloc[-1])
+        return {}
+    pw_high, pw_low = core.prior_week_high_low(prior, day)
+    pm_high, pm_low = core.prior_month_high_low(prior, day)
+    return {
+        "prev_high": float(prior["high"].iloc[-1]),
+        "prev_low": float(prior["low"].iloc[-1]),
+        "prior_week_high": pw_high, "prior_week_low": pw_low,
+        "prior_month_high": pm_high, "prior_month_low": pm_low,
+    }
 
 
 def hypothetical_outcome(bars_after: pd.DataFrame, side: str, entry: float,
@@ -114,7 +129,7 @@ def backtest_symbol(dh, symbol: str, sid: int, seg: str, inst: str,
     today = today[today.index.time >= ls.RUN_START]
     if len(today) < ls.PIVOT_LOOKBACK + 3:
         return []
-    prev_high, prev_low = prev_day_high_low(dh, sid, seg, inst, day)
+    pools = all_pools(dh, sid, seg, inst, day)
 
     hits: list[dict] = []
     for i in range(ls.PIVOT_LOOKBACK + 2, len(today)):
@@ -122,11 +137,18 @@ def backtest_symbol(dh, symbol: str, sid: int, seg: str, inst: str,
         confirm_bar = today.iloc[i]
         prev_window = today.iloc[: i - 1].tail(ls.PIVOT_LOOKBACK)
         atr_value = core.atr(today.iloc[: i], min(14, i))
-        if atr_value <= 0:
+        if atr_value is None or atr_value <= 0 or (isinstance(atr_value, float) and atr_value != atr_value):
             continue
         pivot_highs, pivot_lows = ls._find_pivots(prev_window, ls.PIVOT_WIDTH)
-        pools_high = pivot_highs + ([prev_high] if prev_high else [])
-        pools_low = pivot_lows + ([prev_low] if prev_low else [])
+        # Match live scanner: swing pivots + prev session + prior week + prior month
+        pools_high = list(pivot_highs)
+        pools_low = list(pivot_lows)
+        for key in ("prev_high", "prior_week_high", "prior_month_high"):
+            if pools.get(key) is not None:
+                pools_high.append(float(pools[key]))
+        for key in ("prev_low", "prior_week_low", "prior_month_low"):
+            if pools.get(key) is not None:
+                pools_low.append(float(pools[key]))
         sweep = ls._detect_sweep(sweep_bar, prev_window, pools_high, pools_low, atr_value)
         if not sweep:
             continue
