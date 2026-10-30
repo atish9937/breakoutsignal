@@ -189,9 +189,12 @@ CONFIG = {
     "max_chase_pct": 0.50,       # mechanical: don't recommend it if already >0.5% beyond the edge
     "max_vwap_dist_pct": 1.0,    # price must be within 1% of VWAP to count as "vwap_aligned"
     "stop_atr_mult": 0.35,       # stop distance = 0.35 x ATR (JSW: 0.35 x 30 = ~Rs 11)
-    "min_runway_r": 1.5,         # Commit J: 2.0 -> 1.5 after 2026-10-30 blocked 4+ valid signals
-                                   # (BHARTIARTL CE x3, ICICIBANK CE, BAJAJFINSV CE, TITAN CE) that
-                                   # had 1.0-1.3R to the next OI wall. 1.5R still rejects crammed setups.
+    "min_runway_r": 2.0,         # Commit L: reverted 1.5 -> 2.0 after Dhan replay on 2026-10-30
+                                   # showed the "near-misses" (ICICIBANK CE, BAJAJFINSV CE) that
+                                   # would have unlocked at 1.5R actually LOST that day. The 2.0R
+                                   # gate was correctly protecting against false breakouts into
+                                   # overhead resistance. One day isn't definitive but the evidence
+                                   # that relaxing helps is absent.
     "t1_r": 1.5,                 # target 1 = 1.5R
     "t2_r": 2.5,                 # target 2 = 2.5R (capped just before the wall)
     "wall_frac": 0.5,            # a strike counts as a "wall" if its OI >= 50% of the biggest

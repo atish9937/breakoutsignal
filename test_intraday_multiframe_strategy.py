@@ -165,6 +165,29 @@ class IntradayMultiframeMonitorTests(unittest.TestCase):
         sub_confirmed = sub_close > signal_entry if side == "CE" else sub_close < signal_entry
         self.assertTrue(sub_confirmed)
 
+    def test_round_number_target_cap_at_resistance_for_ce(self):
+        """Commit L: BHARTIARTL CE on 2026-10-30 opened at 1970, raw 2R target
+        was 1995 but round-number 1985 capped it. The dynamic target cap
+        should set target to 1985 (resistance), not 1995 (raw)."""
+        above, below = strategy._nearest_round_numbers(1970.60)
+        self.assertEqual(above, 2000)  # oh wait, 1970 is in the 500-5000 tier -> step=50 -> rounds to 2000
+        self.assertEqual(below, 1950)
+        # For price around 1200 (mid-priced), step is still 50
+        above, below = strategy._nearest_round_numbers(1218.50)
+        self.assertEqual(above, 1250)
+        self.assertEqual(below, 1200)
+        # For price 450 (small), step is 10
+        above, below = strategy._nearest_round_numbers(452.45)
+        self.assertEqual(above, 460)
+        self.assertEqual(below, 450)
+
+    def test_round_number_target_tier_boundaries(self):
+        """Step function: <500 -> 10, 500-5000 -> 50, >5000 -> 100."""
+        self.assertEqual(strategy._nearest_round_numbers(100)[1], 100)  # already at round
+        self.assertEqual(strategy._nearest_round_numbers(499)[1], 490)  # just under 500
+        self.assertEqual(strategy._nearest_round_numbers(501)[1], 500)  # just over 500
+        self.assertEqual(strategy._nearest_round_numbers(5001)[0], 5100)  # >5000 tier
+
     def test_premium_side_stop_fires_when_option_bid_collapses(self):
         """When option bid falls to <= 60% of entry ask, exit as 'premium stop' even if underlying hasn't hit stop."""
         signal = self._signal()

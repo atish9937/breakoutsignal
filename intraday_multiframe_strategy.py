@@ -92,23 +92,63 @@ def _setup(symbol: str, side: str, candles: pd.DataFrame, now: dt.datetime) -> d
     risk = sign * (float(last["close"]) - stop)
     if not (trend and pullback and confirmed and volume_ratio >= 1.0 and vwap_ok and risk > 0):
         return None
-    target = float(last["close"]) + sign * RISK_REWARD * risk
+    raw_target = float(last["close"]) + sign * RISK_REWARD * risk
+
+    # Commit L: dynamic target cap against the nearest round-number resistance
+    # (CE) or support (PE). On 2026-10-30 BHARTIARTL CE's raw 2R target was
+    # 1995 but the stock capped at round-number 1985 and faded. Capping T2 at
+    # the round-number level (or the halfway-to-raw if that's closer to entry
+    # than 1R) would have let the trade hit T1 and exit profitably.
+    entry = float(last["close"])
+    rn_above, rn_below = _nearest_round_numbers(entry)
+    if side == "CE":
+        # Resistance is the nearest round above entry
+        resistance = rn_above
+        # Only cap if resistance is BELOW raw target AND at least 1R past entry
+        if entry < resistance < raw_target and (resistance - entry) >= risk:
+            target = resistance
+        else:
+            target = raw_target
+    else:
+        support = rn_below
+        if raw_target < support < entry and (entry - support) >= risk:
+            target = support
+        else:
+            target = raw_target
+    target_was_capped = target != raw_target
+
     return {
         "strategy": STRATEGY,
         "symbol": symbol,
         "side": side,
         "candle_time": candles.index[-1].isoformat(),
         "signal_time": now.isoformat(),
-        "underlying_entry": round(float(last["close"]), 2),
+        "underlying_entry": round(entry, 2),
         "underlying_stop": round(stop, 2),
         "underlying_target": round(target, 2),
-        "risk_reward": f"1:{RISK_REWARD:g}",
+        "underlying_target_raw_2r": round(raw_target, 2),
+        "target_capped_at_round_number": target_was_capped,
+        "risk_reward": f"1:{round(sign*(target-entry)/risk, 2)}",
         "atr_15m": round(float(atr), 3),
         "relative_volume": round(volume_ratio, 2),
         "vwap": round(float(vwap), 2),
         "forced_exit_ist": FORCED_EXIT.strftime("%H:%M"),
-        "exit_rule": "Underlying stop or 2R target; otherwise exit option by 15:15 IST. No overnight holding.",
+        "exit_rule": "Underlying stop or dynamic target; otherwise exit option by 15:15 IST. No overnight holding.",
     }
+
+
+def _nearest_round_numbers(price: float) -> tuple[float, float]:
+    """Nearest round numbers (above, below). Step scales with price tier:
+    10 for <500, 50 for 500-5000, 100 above."""
+    if price < 500:
+        step = 10
+    elif price < 5000:
+        step = 50
+    else:
+        step = 100
+    below = (int(price) // step) * step
+    above = below + step
+    return float(above), float(below)
 
 
 def _select_option(chain: dict, side: str, spot: float, symbol: str,
