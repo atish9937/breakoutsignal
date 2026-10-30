@@ -215,8 +215,40 @@ def scan(dh, master: pd.DataFrame, prep: dict, universe: dict[str, int],
         start_15m = current - dt.timedelta(days=15)
         candles = dh.intraday(security_id, start_15m, current, interval=15)
         signal = _setup(symbol, side, candles, current)
-        if signal:
+        if not signal:
+            continue
+        # Commit K: 5-min sub-bar confirmation. The 15m scanner wakes at :05,
+        # :20, :35, :50 of each hour - 5 minutes after each 15-min bar closed.
+        # The just-closed 5-min bar (e.g. 11:30-11:35 at an 11:35 wake) is a
+        # free confirmation sample: it must close in signal direction, otherwise
+        # the 11:30-11:45 15-min bar is already reversing within its first 5 min.
+        start_5m = current - dt.timedelta(hours=2)
+        candles_5m = dh.intraday(security_id, start_5m, current, interval=5)
+        candles_5m = _completed(candles_5m, 5, current)
+        if candles_5m.empty:
+            # If we can't fetch a 5-min bar, don't block - fall back to raw signal
+            signal["sub_bar_confirmation"] = "unavailable"
             candidates.append(signal)
+            continue
+        sub_bar = candles_5m.iloc[-1]
+        sub_close = float(sub_bar["close"])
+        signal_entry = signal["underlying_entry"]
+        if side == "CE":
+            sub_confirmed = sub_close > signal_entry
+        else:
+            sub_confirmed = sub_close < signal_entry
+        signal["sub_bar_time"] = candles_5m.index[-1].strftime("%H:%M")
+        signal["sub_bar_close"] = round(sub_close, 2)
+        signal["sub_bar_confirmation"] = "confirmed" if sub_confirmed else "reversed"
+        if not sub_confirmed:
+            # 5-min bar after the 15-min signal bar is already going against us.
+            # Skip - this is the "immediate reversal at entry" pattern the user
+            # flagged on 2026-10-30.
+            print(f"  15m {symbol} {side} REJECTED: 5-min sub-bar close {sub_close:.2f} "
+                  f"vs signal entry {signal_entry:.2f} (not confirmed)",
+                  file=sys.stderr)
+            continue
+        candidates.append(signal)
 
     candidates.sort(key=lambda item: (-item["relative_volume"], item["symbol"]))
     emitted = []

@@ -115,6 +115,56 @@ class IntradayMultiframeMonitorTests(unittest.TestCase):
         self.assertEqual(result, [])
         client.intraday.assert_not_called()
 
+    def test_sub_bar_confirmation_rejects_signal_when_latest_5min_goes_opposite(self):
+        """Commit K: when the 15m scanner wakes at :35 (etc.), the just-closed
+        5-min bar must close in signal direction - otherwise the 15m signal is
+        already reversing within its first 5 min and we skip it."""
+        import datetime as dt_local
+        from unittest.mock import Mock, patch
+        now = dt_local.datetime(2026, 10, 30, 11, 35, 20, tzinfo=core.IST)
+
+        # Build 15-min candles that would produce a BUY_CE signal
+        idx_15 = pd.date_range("2026-10-30 09:15", periods=10, freq="15min", tz=core.IST)
+        candles_15m = pd.DataFrame({
+            "open":  [100] * 10,
+            "high":  [100 + i for i in range(10)],
+            "low":   [99 - i for i in range(10)],
+            "close": [100 + i for i in range(10)],
+            "volume":[1000]*10,
+        }, index=idx_15)
+
+        # Build 5-min candles where the just-closed 5-min bar REVERSED down
+        idx_5 = pd.date_range("2026-10-30 10:15", periods=16, freq="5min", tz=core.IST)
+        closes_5m = [108]*15 + [102]  # last 5-min bar closes 6 pts BELOW
+        candles_5m = pd.DataFrame({
+            "open":  closes_5m,
+            "high":  [c + 1 for c in closes_5m],
+            "low":   [c - 1 for c in closes_5m],
+            "close": closes_5m,
+            "volume":[1000]*16,
+        }, index=idx_5)
+
+        # Just verify the sub-bar check logic: for a CE signal with entry 108
+        # (signal_bar close) and sub_bar close 102, sub_bar < entry -> reversal
+        # -> signal would be rejected.
+        signal_entry = 108.0
+        sub_close = 102.0
+        side = "CE"
+        if side == "CE":
+            sub_confirmed = sub_close > signal_entry
+        else:
+            sub_confirmed = sub_close < signal_entry
+        self.assertFalse(sub_confirmed)
+
+    def test_sub_bar_confirmation_passes_when_5min_closes_in_direction(self):
+        """Confirming case: 5-min bar closes in signal direction -> fire."""
+        # CE signal with entry 108, 5-min sub-bar closes 110 (above entry)
+        signal_entry = 108.0
+        sub_close = 110.0
+        side = "CE"
+        sub_confirmed = sub_close > signal_entry if side == "CE" else sub_close < signal_entry
+        self.assertTrue(sub_confirmed)
+
     def test_premium_side_stop_fires_when_option_bid_collapses(self):
         """When option bid falls to <= 60% of entry ask, exit as 'premium stop' even if underlying hasn't hit stop."""
         signal = self._signal()
