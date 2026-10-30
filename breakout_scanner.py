@@ -189,7 +189,9 @@ CONFIG = {
     "max_chase_pct": 0.50,       # mechanical: don't recommend it if already >0.5% beyond the edge
     "max_vwap_dist_pct": 1.0,    # price must be within 1% of VWAP to count as "vwap_aligned"
     "stop_atr_mult": 0.35,       # stop distance = 0.35 x ATR (JSW: 0.35 x 30 = ~Rs 11)
-    "min_runway_r": 2.0,         # mechanical: next OI wall must be >= 2R away, or there's no room to trade
+    "min_runway_r": 1.5,         # Commit J: 2.0 -> 1.5 after 2026-10-30 blocked 4+ valid signals
+                                   # (BHARTIARTL CE x3, ICICIBANK CE, BAJAJFINSV CE, TITAN CE) that
+                                   # had 1.0-1.3R to the next OI wall. 1.5R still rejects crammed setups.
     "t1_r": 1.5,                 # target 1 = 1.5R
     "t2_r": 2.5,                 # target 2 = 2.5R (capped just before the wall)
     "wall_frac": 0.5,            # a strike counts as a "wall" if its OI >= 50% of the biggest
@@ -215,6 +217,9 @@ CONFIG = {
                                        # Catches small-ATR trap trades (e.g. ONGC 2026-10-29).
     "breadth_min_pct_for_ce": 55.0,   # at least 55% of universe trading above its own VWAP for CE
     "breadth_max_pct_for_pe": 45.0,   # at most 45% of universe above its VWAP for PE (i.e. >=55% below VWAP)
+    "nifty_trend_veto_pct": 0.30,     # Commit J: when Nifty chg_pct > +0.30% block PE / < -0.30% block CE
+                                       # closes the 2026-10-30 failure mode where 4 PE signals fired
+                                       # on a +0.4% Nifty day with lukewarm breadth (42-45%)
     "vix_spike_multiplier": 1.30,     # veto new entries when India VIX > 1.30 * its own 20-day EMA
     "entry_start": "09:30",
     "entry_cutoff": "12:30",
@@ -998,20 +1003,38 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
         })
         res.update({"verdict": f"SKIP_{side}", "fails": ["fewer than 4 completed 5-min candles"], "passes": passes})
         return res
-    last, prev3 = c.iloc[-1], c.iloc[-4:-1]
+    # Commit J: evaluate gates against the SECOND-TO-LAST bar (signal bar) and
+    # treat the just-closed last bar as a CONFIRMATION bar. All indicators and
+    # thresholds are computed on `c_signal` (excluding the confirmation bar) so
+    # a signal fires only when the next bar also closed in the trade direction.
+    if len(c) < 5:
+        res["mechanical_checks"].append({
+            "gate": "Signal + confirmation bars",
+            "current": f"only {len(c)} 5-min bars",
+            "criterion": "need signal + confirmation bars + 3 prior",
+            "passed": False,
+        })
+        res.update({"verdict": f"SKIP_{side}", "fails": ["not enough 5-min bars"], "passes": passes})
+        return res
+    confirm_bar = c.iloc[-1]
+    c_signal = c.iloc[:-1]                 # history through signal bar (inclusive)
+    last = c_signal.iloc[-1]               # signal bar
+    prev3 = c_signal.iloc[-4:-1]           # 3 bars before the signal bar
     # the level being broken = nearest ladder level beyond the previous candle's close
-    level = nearest_level(p, side, float(c["close"].iloc[-2]))
+    level = nearest_level(p, side, float(c_signal["close"].iloc[-2]))
     res["trigger_level"] = r2(level)
-    closes = pd.concat([pd.Series(p.get("warm_closes") or [], dtype=float), c["close"].reset_index(drop=True)],
+    closes = pd.concat([pd.Series(p.get("warm_closes") or [], dtype=float), c_signal["close"].reset_index(drop=True)],
                        ignore_index=True)
-    vw = vwap(c)
+    vw = vwap(c_signal)
     e9, e21 = float(ema(closes, 9).iloc[-1]), float(ema(closes, 21).iloc[-1])
     rs, mh = rsi(closes), macd_hist(closes)
-    slot = (c.index[-1]).strftime("%H:%M")
-    cum_now, cum_avg = float(c["volume"].sum()), (p.get("cum_avg_vol") or {}).get(slot)
+    slot = (c_signal.index[-1]).strftime("%H:%M")
+    cum_now, cum_avg = float(c_signal["volume"].sum()), (p.get("cum_avg_vol") or {}).get(slot)
     rvol = cum_now / cum_avg if cum_avg else None
     vol_ratio = float(last["volume"] / prev3["volume"].mean()) if prev3["volume"].mean() else None
-    res.update({"last_candle_time": c.index[-1].strftime("%H:%M"), "last_close": r2(last["close"]),
+    res.update({"signal_candle_time": c_signal.index[-1].strftime("%H:%M"),
+                "last_candle_time": c.index[-1].strftime("%H:%M"),
+                "last_close": r2(last["close"]), "confirm_close": r2(float(confirm_bar["close"])),
                 "last_volume": int(last["volume"]), "vol_vs_prev3": r2(vol_ratio), "rel_volume_day": r2(rvol),
                 "vwap": r2(vw), "ema9": r2(e9), "ema21": r2(e21), "rsi14_5m": r2(rs), "macd_hist_5m": r2(mh)})
 
@@ -1020,7 +1043,7 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
     # it defines what "a fresh box breakout" even means, it isn't a judgment call.
     beyond = sign * (last["close"] - level) > 0
     live_price_beyond = _live_price_beyond_trigger(side, ltp, level)
-    crossed_recent = any(sign * (x - level) <= 0 for x in c["close"].iloc[-3:-1])
+    crossed_recent = any(sign * (x - level) <= 0 for x in c_signal["close"].iloc[-3:-1])
     triggered = beyond and live_price_beyond and crossed_recent
     chase_pct = sign * (ltp - level) / level * 100
     dist_pct = -chase_pct  # % still to go to reach the level (positive = not reached)
@@ -1080,6 +1103,32 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
     nifty_ok = (side == "CE" and nifty["bias"] != "DOWN") or (side == "PE" and nifty["bias"] != "UP")
     res["vwap_note"] = f"{vdist:+.2f}% from VWAP ({'within' if vwap_ok else 'outside'} {CONFIG['max_vwap_dist_pct']}% band)"
     res["nifty_note"] = f"Nifty bias {nifty['bias']}, trade is {'aligned' if nifty_ok else 'against it'}"
+
+    # Commit J: Nifty intraday-trend hard gate.
+    # Breadth alone misses days where the index is clearly directional but
+    # breadth sits in the 42-55% dead zone (2026-10-30 was +0.4% Nifty with
+    # 42-45% breadth and we fired 4 PE signals that all got crushed).
+    nifty_chg = nifty.get("chg_pct")
+    nifty_trend_cap = CONFIG["nifty_trend_veto_pct"]
+    if nifty_chg is None:
+        nifty_trend_ok = True
+        nifty_trend_text = "Nifty chg_pct unavailable"
+    elif side == "CE" and nifty_chg < -nifty_trend_cap:
+        nifty_trend_ok = False
+        nifty_trend_text = f"Nifty {nifty_chg:+.2f}% - too bearish for CE (cap -{nifty_trend_cap:.2f}%)"
+    elif side == "PE" and nifty_chg > nifty_trend_cap:
+        nifty_trend_ok = False
+        nifty_trend_text = f"Nifty {nifty_chg:+.2f}% - too bullish for PE (cap +{nifty_trend_cap:.2f}%)"
+    else:
+        nifty_trend_ok = True
+        nifty_trend_text = f"Nifty {nifty_chg:+.2f}% within +/-{nifty_trend_cap:.2f}% for {side}"
+    record_check(
+        "Nifty intraday trend",
+        nifty_trend_text,
+        f"Nifty chg_pct within +/-{nifty_trend_cap:.2f}% (or aligned with {side} direction)",
+        nifty_trend_ok,
+    )
+    (passes if nifty_trend_ok else fails).append(nifty_trend_text)
 
     # Prior-day H/L alignment - a true breakout trades beyond the prior session's extreme.
     prev_level = p.get("prev_high") if side == "CE" else p.get("prev_low")
@@ -1383,6 +1432,26 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
     # quality score clears min_recommend_score. AI's role (see "ai_validation" below) is to
     # VALIDATE that already-made recommendation against catalyst/news, cross-candidate
     # correlation and regime - things the script can't check - not to originate the call itself.
+    # Commit J: Next-bar confirmation - the just-closed bar after the signal
+    # bar must close in the trade direction. Catches the 2026-10-30 pattern
+    # where SHRIRAMFIN PE / HINDALCO PE signal bars closed below their trigger
+    # but the very next bar rallied, stopping the position.
+    signal_close = float(last["close"])
+    confirm_close_val = float(confirm_bar["close"])
+    if side == "CE":
+        next_bar_ok = confirm_close_val > signal_close
+    else:
+        next_bar_ok = confirm_close_val < signal_close
+    record_check(
+        "Next-bar confirmation",
+        f"signal close {signal_close:.2f} -> confirm close {confirm_close_val:.2f}",
+        f"confirm bar closes {'above' if side == 'CE' else 'below'} signal bar in trade direction",
+        next_bar_ok,
+    )
+    (passes if next_bar_ok else fails).append(
+        f"next-bar {'+' if next_bar_ok else 'reversed'}"
+    )
+
     mechanical_gates = {
         "room left (ATR used)": atr_ok,
         "fresh trigger": trigger_ok,
@@ -1398,7 +1467,9 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
         "MACD momentum": macd_ok,
         "T1 distance clears spread": t1_distance_ok,
         "market breadth aligned": breadth_ok,
+        "Nifty intraday trend": nifty_trend_ok,
         "India VIX regime": vix_ok,
+        "Next-bar confirmation": next_bar_ok,
     }
     mechanical_ok = all(mechanical_gates.values())
     if mechanical_ok and quality_true >= CONFIG["min_recommend_score"]:

@@ -154,6 +154,67 @@ def _nearest_pool_below(pools: list[float], price: float) -> float | None:
     return max(below) if below else None
 
 
+def _opening_range_hl(today_bars: pd.DataFrame, minutes: int = 15) -> tuple[float | None, float | None]:
+    """High/low of the opening-range (first N minutes of session). Classic
+    liquidity magnet - stops accumulate around the OR extremes."""
+    if today_bars.empty:
+        return None, None
+    first_timestamp = today_bars.index[0]
+    cutoff = first_timestamp + pd.Timedelta(minutes=minutes)
+    or_bars = today_bars[today_bars.index < cutoff]
+    if or_bars.empty:
+        return None, None
+    return float(or_bars["high"].max()), float(or_bars["low"].min())
+
+
+def _prev_hour_hl(today_bars: pd.DataFrame, now: dt.datetime) -> tuple[float | None, float | None]:
+    """Rolling previous-hour high/low (the 60 min that just completed before
+    the current hour-aligned window). Intraday liquidity level."""
+    if today_bars.empty:
+        return None, None
+    current_hour = pd.Timestamp(now).replace(minute=0, second=0, microsecond=0)
+    prev_hour_start = current_hour - pd.Timedelta(hours=1)
+    hour_bars = today_bars[(today_bars.index >= prev_hour_start) & (today_bars.index < current_hour)]
+    if hour_bars.empty:
+        return None, None
+    return float(hour_bars["high"].max()), float(hour_bars["low"].min())
+
+
+def _session_vwap(today_bars: pd.DataFrame) -> float | None:
+    """Session VWAP - price gravitates here, stops cluster above/below."""
+    if today_bars.empty:
+        return None
+    tp = (today_bars["high"] + today_bars["low"] + today_bars["close"]) / 3
+    v = today_bars["volume"].sum()
+    if v <= 0:
+        return None
+    return float((tp * today_bars["volume"]).sum() / v)
+
+
+def _nearest_round_numbers(price: float, step: float = None) -> tuple[float, float]:
+    """Return (nearest round-number above, nearest below). Round-number step
+    scales with price: 10 for < 500, 50 for 500-5000, 100 above."""
+    if step is None:
+        if price < 500:
+            step = 10
+        elif price < 5000:
+            step = 50
+        else:
+            step = 100
+    below = (int(price) // step) * step
+    above = below + step
+    return float(above), float(below)
+
+
+def _prev_day_typical(prev_high: float | None, prev_low: float | None,
+                      prev_close: float | None) -> float | None:
+    """Previous day's typical price (H+L+C)/3 - an institutional magnet level."""
+    vals = [v for v in (prev_high, prev_low, prev_close) if v is not None]
+    if len(vals) < 3:
+        return None
+    return sum(vals) / 3
+
+
 def _wick_ratios(bar: pd.Series) -> tuple[float, float]:
     """Return (upper_wick_ratio, lower_wick_ratio) relative to total bar range."""
     high = float(bar["high"])
@@ -278,7 +339,8 @@ def evaluate_setup(symbol: str, candles: pd.DataFrame, now: dt.datetime,
                    prior_week_high: float | None = None,
                    prior_week_low: float | None = None,
                    prior_month_high: float | None = None,
-                   prior_month_low: float | None = None) -> dict:
+                   prior_month_low: float | None = None,
+                   prev_close: float | None = None) -> dict:
     """Evaluate the last-closed 5-min bar as a potential sweep + confirmation entry.
 
     `candles` must be the 5-min candle series (completed bars only). The
@@ -330,22 +392,45 @@ def evaluate_setup(symbol: str, candles: pd.DataFrame, now: dt.datetime,
     pool_highs = list(pivot_highs)
     pool_lows = list(pivot_lows)
     pool_sources: dict[float, str] = {}
+    # Commit J: expanded intraday pool set - these are the levels where stops
+    # actually cluster beyond the once-a-day daily/weekly/monthly extremes.
+    or_high, or_low = _opening_range_hl(today, minutes=15)
+    prev_hour_high, prev_hour_low = _prev_hour_hl(today, now)
+    session_vwap = _session_vwap(today)
+    prev_day_typical = _prev_day_typical(prev_high, prev_low, prev_close)
+    # Nearest round numbers above/below current price
+    current_price = float(today.iloc[-1]["close"]) if len(today) else None
+    rn_above = rn_below = None
+    if current_price:
+        rn_above, rn_below = _nearest_round_numbers(current_price)
+
     for level, label in (
         (prev_high, "prev_session_high"),
         (prior_week_high, "prior_week_high"),
         (prior_month_high, "prior_month_high"),
+        (or_high, "opening_range_high"),
+        (prev_hour_high, "prev_hour_high"),
+        (session_vwap, "session_vwap"),
+        (rn_above, "round_number"),
+        (prev_day_typical, "prev_day_typical_price"),
     ):
         if level is not None:
             pool_highs.append(float(level))
-            pool_sources[float(level)] = label
+            # First-win assignment preserves most-institutional label when levels coincide
+            pool_sources.setdefault(float(level), label)
     for level, label in (
         (prev_low, "prev_session_low"),
         (prior_week_low, "prior_week_low"),
         (prior_month_low, "prior_month_low"),
+        (or_low, "opening_range_low"),
+        (prev_hour_low, "prev_hour_low"),
+        (session_vwap, "session_vwap"),
+        (rn_below, "round_number"),
+        (prev_day_typical, "prev_day_typical_price"),
     ):
         if level is not None:
             pool_lows.append(float(level))
-            pool_sources[float(level)] = label
+            pool_sources.setdefault(float(level), label)
 
     sweep = _detect_sweep(sweep_bar, prev_window, pool_highs, pool_lows, atr_value)
     sweep_passed = sweep is not None
@@ -717,10 +802,11 @@ def _index_hl_pools(dh, sid: int, seg: str, day: dt.date) -> dict:
         return {}
     prev_high = float(prior["high"].iloc[-1])
     prev_low = float(prior["low"].iloc[-1])
+    prev_close = float(prior["close"].iloc[-1])
     pw_high, pw_low = core.prior_week_high_low(prior, day)
     pm_high, pm_low = core.prior_month_high_low(prior, day)
     pools = {
-        "prev_high": prev_high, "prev_low": prev_low,
+        "prev_high": prev_high, "prev_low": prev_low, "prev_close": prev_close,
         "prior_week_high": pw_high, "prior_week_low": pw_low,
         "prior_month_high": pm_high, "prior_month_low": pm_low,
     }
@@ -822,6 +908,7 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
                 prior_week_low=prep_entry.get("prior_week_low"),
                 prior_month_high=prep_entry.get("prior_month_high"),
                 prior_month_low=prep_entry.get("prior_month_low"),
+                prev_close=prep_entry.get("prev_close"),
             )
             if result.get("verdict") == f"SETUP_{result.get('side')}":
                 if not stock_expiry:
@@ -862,6 +949,7 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
                 prior_week_low=pools.get("prior_week_low"),
                 prior_month_high=pools.get("prior_month_high"),
                 prior_month_low=pools.get("prior_month_low"),
+                prev_close=pools.get("prev_close"),
             )
             if result.get("verdict") == f"SETUP_{result.get('side')}":
                 idx_expiry = _pick_index_expiry(dh, sid, seg, day, OPTION_MIN_DTE_DAYS)

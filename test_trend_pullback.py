@@ -13,8 +13,11 @@ class TrendPullbackTests(unittest.TestCase):
         prior_index = pd.date_range(
             "2026-10-16 10:00", periods=55, freq="5min", tz=core.IST
         )
+        # Commit J: tests fixture now carries 6 bars today - 5 for the setup
+        # (same as before), plus 1 final "confirmation" bar that closes above
+        # the signal bar's close to pass the new Next-bar-confirmation gate.
         today_index = pd.date_range(
-            "2026-10-19 10:00", periods=5, freq="5min", tz=core.IST
+            "2026-10-19 10:00", periods=6, freq="5min", tz=core.IST
         )
         index = prior_index.append(today_index)
         rows = [[100, 101, 99, 100, 100] for _ in prior_index]
@@ -23,7 +26,8 @@ class TrendPullbackTests(unittest.TestCase):
             [107, 110, 105, 107, 100],
             [105, 108, 104, 105, 100],
             [106, 107, 105, 106, 100],
-            [107, 109, 106, 108, 120],
+            [107, 109, 106, 108, 120],   # SIGNAL bar - matches original design
+            [108, 110, 107, 109, 110],   # CONFIRMATION bar - closes above signal for CE
         ])
         return pd.DataFrame(
             rows, index=index, columns=["open", "high", "low", "close", "volume"]
@@ -55,8 +59,10 @@ class TrendPullbackTests(unittest.TestCase):
         self.assertEqual(result["side"], "CE")
         self.assertEqual(result["verdict"], "SETUP_CE")
         self.assertTrue(all(check["passed"] for check in result["mechanical_checks"]))
-        self.assertEqual(result["plan"]["stop"], 106.0)
-        self.assertEqual(result["plan"]["t2"], 112.0)
+        # Commit J: entry = confirmation bar close (109), not signal bar close (108)
+        self.assertEqual(result["plan"]["entry"], 109.0)
+        self.assertEqual(result["plan"]["stop"], 107.0)
+        self.assertEqual(result["plan"]["t2"], 113.0)
 
     def test_opposing_nifty_bias_prevents_setup(self):
         result = self.evaluate(bias="DOWN")
@@ -66,12 +72,15 @@ class TrendPullbackTests(unittest.TestCase):
 
     def test_bearish_pullback_selects_put_and_checks_downtrend(self):
         candles = self.make_candles()
-        candles.loc[candles.index[-5]:, ["open", "high", "low", "close", "volume"]] = [
+        # Commit J: 6 bars total today - 5 for the setup + 1 confirmation that
+        # closes BELOW the signal bar's close for the PE confirmation to fire.
+        candles.loc[candles.index[-6]:, ["open", "high", "low", "close", "volume"]] = [
             [90, 91, 89, 90, 100],
             [93, 95, 90, 93, 100],
             [95, 96, 92, 95, 100],
             [94, 95, 93, 94, 100],
-            [92, 94, 91, 92, 120],
+            [92, 94, 91, 92, 120],   # SIGNAL bar (close 92 < previous.low 93)
+            [91, 92, 90, 90, 110],   # CONFIRMATION bar (close 90 < signal close 92)
         ]
 
         def fake_ema(values, span):
@@ -143,7 +152,9 @@ class TrendPullbackTests(unittest.TestCase):
 
         self.assertEqual(result["verdict"], "BUY_CE")
         self.assertEqual(result["option"]["security_id"], 12345)
-        self.assertEqual(result["plan"]["runway_r"], 2.0)
+        # Commit J: entry is now the confirmation bar close (109) not the signal
+        # bar close (108), so runway to wall (112) shrinks: (112-109)/2 = 1.5R.
+        self.assertEqual(result["plan"]["runway_r"], 1.5)
 
     def test_insufficient_oi_runway_blocks_recommendation(self):
         result = self.evaluate()

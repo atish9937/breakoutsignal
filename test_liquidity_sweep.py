@@ -356,6 +356,72 @@ class IndexSupportTests(unittest.TestCase):
             # Acceptable alternative: scanner refuses the signal
             self.assertEqual(result["verdict"], "WATCH_CE")
 
+    def test_opening_range_hl_covers_first_15min(self):
+        import datetime as dt_local
+        idx = pd.date_range("2026-10-30 09:15:00", periods=10, freq="5min", tz=IST)
+        df = pd.DataFrame({
+            "open": [100, 102, 105, 108, 110, 112, 115, 118, 120, 122],
+            "high": [103, 106, 108, 112, 114, 116, 118, 121, 123, 125],
+            "low":  [ 99, 101, 103, 107, 109, 111, 113, 116, 118, 120],
+            "close":[102, 105, 107, 111, 113, 115, 117, 120, 122, 124],
+            "volume":[1000]*10,
+        }, index=idx)
+        hi, lo = strategy._opening_range_hl(df, minutes=15)
+        # First 15 min = 09:15, 09:20, 09:25 bars
+        self.assertEqual(hi, 108)  # max of 103, 106, 108
+        self.assertEqual(lo, 99)   # min of 99, 101, 103
+
+    def test_prev_hour_hl_pulls_the_full_60min_window(self):
+        import datetime as dt_local
+        idx = pd.date_range("2026-10-30 10:00:00", periods=24, freq="5min", tz=IST)
+        df = pd.DataFrame({
+            "open":  [100]*24,
+            "high":  [110 + i for i in range(24)],
+            "low":   [90 - i for i in range(24)],
+            "close": [100]*24,
+            "volume":[1000]*24,
+        }, index=idx)
+        now = dt_local.datetime(2026, 10, 30, 12, 15, tzinfo=IST)
+        # prev hour = 11:00-12:00 (bars 12 through 23 in 10:00-12:00 range,
+        # but bars 10:00-11:00 and 11:00-12:00). Our window is 11:00-12:00.
+        hi, lo = strategy._prev_hour_hl(df, now)
+        self.assertIsNotNone(hi)
+        self.assertIsNotNone(lo)
+
+    def test_round_number_scales_with_price(self):
+        # Mid-priced stock
+        above, below = strategy._nearest_round_numbers(452.75)
+        self.assertEqual(above, 460)
+        self.assertEqual(below, 450)
+        # High-priced stock
+        above, below = strategy._nearest_round_numbers(1960.60)
+        self.assertEqual(above, 2000)
+        self.assertEqual(below, 1950)
+        # Index
+        above, below = strategy._nearest_round_numbers(22840)
+        self.assertEqual(above, 22900)
+        self.assertEqual(below, 22800)
+
+    def test_prev_day_typical_averages_hlc(self):
+        self.assertAlmostEqual(strategy._prev_day_typical(100, 90, 95), 95.0)
+        self.assertIsNone(strategy._prev_day_typical(100, 90, None))
+
+    def test_session_vwap_uses_volume_weighted_typical(self):
+        idx = pd.date_range("2026-10-30 09:15:00", periods=3, freq="5min", tz=IST)
+        df = pd.DataFrame({
+            "open":  [100, 102, 101],
+            "high":  [102, 104, 103],
+            "low":   [ 98, 100,  99],
+            "close": [101, 102, 101],
+            "volume":[1000, 2000, 1000],
+        }, index=idx)
+        vwap = strategy._session_vwap(df)
+        # tp = (102+98+101)/3, (104+100+102)/3, (103+99+101)/3
+        # = 100.33, 102.00, 101.00
+        # weighted avg = (100.33*1000 + 102*2000 + 101*1000) / 4000
+        # = (100333 + 204000 + 101000) / 4000 = 405333 / 4000 ~= 101.33
+        self.assertAlmostEqual(vwap, 101.333, places=2)
+
     def test_index_prev_high_low_caches_per_day(self):
         """A 60-cycle session must only hit dh.daily once per index per day."""
         day = dt.date(2026, 10, 29)

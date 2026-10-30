@@ -47,6 +47,10 @@ VIX_SPIKE_MULTIPLIER = 1.30
 MIN_T1_DISTANCE_PCT = 0.40       # Commit G: reject when T1 is < 0.40% of entry -
                                   # option bid/ask spread + slippage would eat any
                                   # realistic gain (ONGC 2026-10-29 was the case study)
+NIFTY_TREND_VETO_PCT = 0.30      # Commit J: block PE when Nifty chg_pct > +0.30%,
+                                  # block CE when Nifty chg_pct < -0.30% - catches
+                                  # the 2026-10-30 failure mode (3 PE signals fired
+                                  # on a +0.4% Nifty day)
 OUT = core.OUT
 
 
@@ -92,12 +96,29 @@ def evaluate_setup(symbol, candles, now, nifty_bias, daily_ctx=None,
         result["fails"].append("not enough completed candles")
         return result
 
+    # Commit J: use the second-to-last bar as the SIGNAL bar and the just-closed
+    # bar as the CONFIRMATION. All gates evaluate against the signal bar; the
+    # final "Next-bar confirmation" gate requires the confirmation bar to close
+    # in the signal direction. Fixes the "immediate reversal at entry" failure
+    # observed on 2026-10-30 (SHRIRAMFIN, HINDALCO PE both reversed before fire).
+    if len(today) < 3:
+        _record = lambda *a, **k: None  # noqa: E731
+        record_check(checks, "Signal + confirmation bars",
+                     f"only {len(today)} bars today",
+                     "need signal bar + confirmation bar + 1 prior", False)
+        result["verdict"] = "SKIP"
+        result["fails"].append("not enough bars for signal+confirmation window")
+        return result
     closes = candles["close"]
-    ema9 = core.ema(closes, 9)
-    ema21 = core.ema(closes, 21)
-    ema50 = core.ema(closes, 50)
-    last = today.iloc[-1]
-    previous = today.iloc[-2]
+    # Compute EMAs excluding the confirmation bar so the signal is based only on
+    # history up to and including the signal bar (deterministic between cycles).
+    closes_through_signal = closes.iloc[:-1]
+    ema9 = core.ema(closes_through_signal, 9)
+    ema21 = core.ema(closes_through_signal, 21)
+    ema50 = core.ema(closes_through_signal, 50)
+    confirm_bar = today.iloc[-1]
+    last = today.iloc[-2]
+    previous = today.iloc[-3]
     e9, e21, e50 = float(ema9.iloc[-1]), float(ema21.iloc[-1]), float(ema50.iloc[-1])
 
     if e9 > e21 > e50:
@@ -113,9 +134,11 @@ def evaluate_setup(symbol, candles, now, nifty_bias, daily_ctx=None,
         trend_ok = False
         trend_text = f"EMA9 {e9:.2f}; EMA21 {e21:.2f}; EMA50 {e50:.2f}"
 
+    today_through_signal = today.iloc[:-1]  # excludes the confirmation bar
     result.update({
         "side": side,
-        "ltp": core.r2(float(last["close"])),
+        "ltp": core.r2(float(confirm_bar["close"])),  # Commit J: entry is confirm close
+        "signal_bar_time": today.index[-2].strftime("%H:%M"),
         "last_candle_time": today.index[-1].strftime("%H:%M"),
         "ema9": core.r2(e9),
         "ema21": core.r2(e21),
@@ -128,8 +151,8 @@ def evaluate_setup(symbol, candles, now, nifty_bias, daily_ctx=None,
         result["fails"].append("no aligned 5-minute trend")
         return result
 
-    tolerance = max(abs(e21) * 0.0005, core.atr(today, 14) * PULLBACK_ATR_TOLERANCE)
-    recent = today.tail(PULLBACK_BARS)
+    tolerance = max(abs(e21) * 0.0005, core.atr(today_through_signal, 14) * PULLBACK_ATR_TOLERANCE)
+    recent = today_through_signal.tail(PULLBACK_BARS)
     if side == "CE":
         touched = bool((recent["low"] <= ema21.loc[recent.index] + tolerance).any())
     else:
@@ -148,22 +171,22 @@ def evaluate_setup(symbol, candles, now, nifty_bias, daily_ctx=None,
                  "completed candle closes beyond previous candle in trend direction and EMA9",
                  confirmation)
 
-    vw = core.vwap(today)
+    vw = core.vwap(today_through_signal)
     vwap_ok = float(last["close"]) > vw if side == "CE" else float(last["close"]) < vw
     record_check(checks, "VWAP alignment", f"close {last['close']:.2f}; VWAP {vw:.2f}",
                  "close above VWAP for CE; below VWAP for PE", vwap_ok)
 
-    rs = core.rsi(closes)
+    rs = core.rsi(closes_through_signal)
     rsi_ok = 50 <= rs <= 70 if side == "CE" else 30 <= rs <= 50
     record_check(checks, "RSI momentum", f"{rs:.1f}",
                  "50–70 for CE; 30–50 for PE", rsi_ok)
 
-    macd = core.macd_hist(closes)
+    macd = core.macd_hist(closes_through_signal)
     macd_ok = macd > 0 if side == "CE" else macd < 0
     record_check(checks, "MACD momentum", f"histogram {macd:.4f}",
                  "positive for CE; negative for PE", macd_ok)
 
-    previous_volume = today["volume"].iloc[-4:-1]
+    previous_volume = today_through_signal["volume"].iloc[-4:-1]
     volume_ratio = (float(last["volume"]) / float(previous_volume.mean())
                     if len(previous_volume) == 3 and previous_volume.mean() > 0 else 0.0)
     volume_ok = volume_ratio >= MIN_VOLUME_RATIO
@@ -171,12 +194,45 @@ def evaluate_setup(symbol, candles, now, nifty_bias, daily_ctx=None,
     record_check(checks, "Confirmation volume", f"{volume_ratio:.2f}x previous 3-bar average",
                  f">= {MIN_VOLUME_RATIO:.2f}x", volume_ok)
 
+    # Commit J: NEW gate - confirmation bar must close in the signal direction.
+    # Signal bar closed at `last["close"]`; confirmation bar is `confirm_bar`.
+    signal_close = float(last["close"])
+    confirm_close = float(confirm_bar["close"])
+    if side == "CE":
+        next_bar_ok = confirm_close > signal_close
+    else:
+        next_bar_ok = confirm_close < signal_close
+    record_check(
+        checks, "Next-bar confirmation",
+        f"signal close {signal_close:.2f} -> confirm close {confirm_close:.2f}",
+        "confirmation bar closes beyond signal bar in trade direction",
+        next_bar_ok,
+    )
+
     aligned = ((side == "CE" and nifty_bias["bias"] != "DOWN")
                or (side == "PE" and nifty_bias["bias"] != "UP"))
     record_check(checks, "Nifty alignment", nifty_bias["bias"],
                  "not opposed to the trade direction", aligned)
 
-    atr_value = core.atr(today, 14)
+    # Commit J: Nifty intraday-trend hard gate (continuous, not just bias flag).
+    nifty_chg = nifty_bias.get("chg_pct")
+    if nifty_chg is None:
+        nifty_trend_ok = True
+        nifty_trend_text = "Nifty chg_pct unavailable"
+    elif side == "CE" and nifty_chg < -NIFTY_TREND_VETO_PCT:
+        nifty_trend_ok = False
+        nifty_trend_text = f"Nifty {nifty_chg:+.2f}% - too bearish for CE (cap -{NIFTY_TREND_VETO_PCT:.2f}%)"
+    elif side == "PE" and nifty_chg > NIFTY_TREND_VETO_PCT:
+        nifty_trend_ok = False
+        nifty_trend_text = f"Nifty {nifty_chg:+.2f}% - too bullish for PE (cap +{NIFTY_TREND_VETO_PCT:.2f}%)"
+    else:
+        nifty_trend_ok = True
+        nifty_trend_text = f"Nifty {nifty_chg:+.2f}% within +/-{NIFTY_TREND_VETO_PCT:.2f}% band"
+    record_check(checks, "Nifty intraday trend", nifty_trend_text,
+                 f"chg_pct within +/-{NIFTY_TREND_VETO_PCT:.2f}% or aligned with {side}",
+                 nifty_trend_ok)
+
+    atr_value = core.atr(today_through_signal, 14)
     extension = sign * (float(last["close"]) - e9)
     extension_ok = atr_value > 0 and extension <= MAX_EXTENSION_ATR * atr_value
     record_check(checks, "Entry extension", f"{extension:.2f}; ATR {atr_value:.2f}",
@@ -256,7 +312,9 @@ def evaluate_setup(symbol, candles, now, nifty_bias, daily_ctx=None,
                  divergence_ok)
 
     risk = atr_value
-    entry_price = float(last["close"])
+    # Commit J: entry at confirmation bar close (real price when we fire),
+    # NOT the signal bar close - the confirmation bar is just-closed at scan time.
+    entry_price = float(confirm_bar["close"])
     t1_price = entry_price + sign * risk
     # Commit G: minimum T1 distance filter - stops ONGC-style tiny-ATR traps
     # where option spread + slippage would exceed the realistic gain.
