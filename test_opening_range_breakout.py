@@ -167,6 +167,33 @@ class ORBConfigTests(unittest.TestCase):
         self.assertEqual(strategy.MIN_T1_DISTANCE_PCT, 0.40)
 
 
+class IndexSupportTests(unittest.TestCase):
+    """Commit N: ORB now scans NIFTY + BANKNIFTY alongside the stock universe.
+    Reuses liquidity_sweep's INDICES config so index pool/expiry resolution
+    stays consistent across both strategies."""
+
+    def test_orb_reads_indices_from_liquidity_sweep(self):
+        """ORB intentionally has no local INDICES config - the index iteration
+        inside scan() imports and uses liquidity_sweep.INDICES. This test
+        pins that contract so a future refactor can't silently drop index
+        support."""
+        import liquidity_sweep as ls
+        self.assertIn("NIFTY", ls.INDICES)
+        self.assertIn("BANKNIFTY", ls.INDICES)
+        self.assertEqual(ls.INDICES["NIFTY"]["sid"], 13)
+        self.assertEqual(ls.INDICES["BANKNIFTY"]["sid"], 25)
+
+    def test_orb_scan_body_references_indices_block(self):
+        """Guard against the index block being accidentally removed from scan()."""
+        import pathlib
+        src = pathlib.Path("opening_range_breakout.py").read_text(encoding="utf-8")
+        # Index iteration must reference liquidity_sweep.INDICES
+        self.assertIn("_ls.INDICES.items()", src,
+                      "ORB.scan() must iterate liquidity_sweep.INDICES for index coverage")
+        # Must stamp underlying_security_id on index results so ledger insert works
+        self.assertIn('result["underlying_security_id"] = sid', src)
+
+
 class RoundNumberHelperTests(unittest.TestCase):
     def test_tiers(self):
         # <500 -> step 10

@@ -582,6 +582,7 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
         except Exception as exc:   # noqa: BLE001
             print(f"ORB Telegram notify failed: {exc}", file=sys.stderr)
 
+    # ---- Equity universe -----------------------------------------------------
     for symbol, sid in universe.items():
         try:
             candles = dh.intraday(sid, frm, now)
@@ -610,6 +611,51 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
                 "strategy": STRATEGY, "symbol": symbol, "side": None,
                 "verdict": "SKIP", "fails": [f"{type(exc).__name__}: {exc}"],
                 "mechanical_checks": [],
+            })
+
+    # ---- Index universe (Nifty 50, Bank Nifty) ------------------------------
+    # Commit N: ORB on indices. Index gap days are the cleanest expression of
+    # the pattern - deepest option liquidity, direct macro bet. Reuses
+    # liquidity_sweep's INDICES config and helpers so index pool/expiry
+    # resolution stays consistent across both strategies.
+    import liquidity_sweep as _ls
+    for index_name, cfg in _ls.INDICES.items():
+        sid = cfg["sid"]
+        seg = cfg["underlying_seg"]
+        try:
+            pools = _ls._index_hl_pools(dh, sid, seg, day)
+            candles = dh.intraday(sid, frm, now, seg=seg, inst="INDEX")
+            candles = candles[candles.index <= pd.Timestamp(now) - pd.Timedelta(minutes=5)]
+            result = evaluate_setup(
+                index_name, candles, now,
+                pools.get("prev_high"), pools.get("prev_low"),
+                nifty, vix, breadth,
+            )
+            if result.get("verdict") == f"SETUP_{result.get('side')}":
+                idx_expiry = _ls._pick_index_expiry(dh, sid, seg, day, OPTION_MIN_DTE_DAYS)
+                if not idx_expiry:
+                    _record(result["mechanical_checks"], "Option expiry",
+                            "no expiry at DTE threshold", "valid expiry available", False)
+                    result["fails"].append("index option expiry unavailable")
+                    result["verdict"] = f"WATCH_{result['side']}"
+                else:
+                    chain = dh.option_chain(sid, idx_expiry, seg=seg)
+                    result = attach_option_check(result, master, idx_expiry, chain, day=day)
+            result["underlying_segment"] = seg
+            # Index symbols aren't in the equity universe - stamp the sid so
+            # record_buy_recommendations can resolve it (same pattern as
+            # Commit I fix for liquidity_sweep indices).
+            result["underlying_security_id"] = sid
+            _fire_if_ready(result)
+            results.append(result)
+        except core.DhanAuthError:
+            raise
+        except Exception as exc:   # noqa: BLE001
+            results.append({
+                "strategy": STRATEGY, "symbol": index_name, "side": None,
+                "verdict": "SKIP", "fails": [f"{type(exc).__name__}: {exc}"],
+                "mechanical_checks": [],
+                "underlying_segment": seg,
             })
 
     snapshot = {
