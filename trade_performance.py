@@ -17,7 +17,7 @@ import requests
 import option_positions
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 ACTIVE_STATUSES = ("tracking", "t1_hit")
 WIN_STATUSES = ("t1_hit", "t2_hit", "t1_then_breakeven")
 RESOLVED_STATUSES = (*WIN_STATUSES, "stop_before_t1")
@@ -39,7 +39,7 @@ def connect(database: Path) -> sqlite3.Connection:
         );
         CREATE TABLE IF NOT EXISTS paper_trades (
             id INTEGER PRIMARY KEY,
-            strategy TEXT NOT NULL CHECK (strategy IN ('breakout', 'trend_pullback', 'liquidity_sweep')),
+            strategy TEXT NOT NULL CHECK (strategy IN ('breakout', 'trend_pullback', 'liquidity_sweep', 'opening_range_breakout')),
             session_date TEXT NOT NULL,
             symbol TEXT NOT NULL,
             side TEXT NOT NULL CHECK (side IN ('CE', 'PE')),
@@ -192,78 +192,79 @@ def connect(database: Path) -> sqlite3.Connection:
         (now,),
     )
 
-    # Migration v6: widen the strategy CHECK constraint to include
-    # 'liquidity_sweep'. SQLite can't ALTER a CHECK in place, so we rebuild
-    # paper_trades by creating a new table, copying data, dropping old,
-    # renaming new. Only runs once per database (gated on the migrations row).
-    already_at_v6 = connection.execute(
-        "SELECT 1 FROM schema_migrations WHERE version >= 6"
+    # Migration v6+v7: widen the strategy CHECK constraint. SQLite can't ALTER
+    # a CHECK in place, so we rebuild paper_trades. The gate checks for the
+    # NEWEST strategy name - if it's not in the current SQL, the migration
+    # runs. This is safe to re-execute as new strategies are added over time
+    # (just extend the check for each new strategy name).
+    required_strategies = ("liquidity_sweep", "opening_range_breakout")
+    current_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='paper_trades'"
     ).fetchone()
-    if not already_at_v6:
-        # Discover what the current strategy CHECK looks like before rebuilding
-        current_sql = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='paper_trades'"
-        ).fetchone()
-        if current_sql and "'liquidity_sweep'" not in (current_sql[0] or ""):
-            # Capture current columns so the copy preserves everything through
-            # ALTER-added columns (option_security_id, entry_at, etc.)
-            existing_cols = [
-                row["name"]
-                for row in connection.execute(
-                    "PRAGMA table_info(paper_trades)"
-                ).fetchall()
-            ]
-            col_list = ", ".join(existing_cols)
-            connection.executescript(
-                """
-                CREATE TABLE paper_trades_v6 (
-                    id INTEGER PRIMARY KEY,
-                    strategy TEXT NOT NULL CHECK (strategy IN ('breakout', 'trend_pullback', 'liquidity_sweep')),
-                    session_date TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    side TEXT NOT NULL CHECK (side IN ('CE', 'PE')),
-                    security_id INTEGER NOT NULL CHECK (security_id > 0),
-                    signal_time TEXT NOT NULL,
-                    entry_at TEXT,
-                    reference_entry REAL NOT NULL,
-                    stop_price REAL NOT NULL,
-                    target_1 REAL NOT NULL,
-                    target_2 REAL NOT NULL,
-                    last_price REAL,
-                    option_security_id INTEGER,
-                    option_expiry TEXT,
-                    option_instrument TEXT NOT NULL DEFAULT 'OPTSTK',
-                    option_segment TEXT NOT NULL DEFAULT 'NSE_FNO',
-                    option_entry_ltp REAL,
-                    option_entry_bid REAL,
-                    option_entry_ask REAL,
-                    option_lot_size INTEGER,
-                    signal_json TEXT,
-                    data_capture_error TEXT,
-                    status TEXT NOT NULL CHECK (
-                        status IN ('tracking', 'stop_before_t1', 't1_hit', 't2_hit',
-                                   't1_then_breakeven', 'unresolved')
-                    ),
-                    target_1_at TEXT,
-                    target_2_at TEXT,
-                    stop_at TEXT,
-                    last_candle_at TEXT,
-                    tracking_error TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE (strategy, session_date, symbol, side)
-                );
-                """
-            )
-            connection.execute(
-                f"INSERT INTO paper_trades_v6 ({col_list}) SELECT {col_list} FROM paper_trades"
-            )
-            connection.executescript(
-                """
-                DROP TABLE paper_trades;
-                ALTER TABLE paper_trades_v6 RENAME TO paper_trades;
-                """
-            )
+    current_sql_text = (current_sql[0] if current_sql else "") or ""
+    missing_strategy = any(
+        f"'{s}'" not in current_sql_text for s in required_strategies
+    )
+    if missing_strategy:
+        # Capture current columns so the copy preserves everything through
+        # ALTER-added columns (option_security_id, entry_at, etc.)
+        existing_cols = [
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(paper_trades)"
+            ).fetchall()
+        ]
+        col_list = ", ".join(existing_cols)
+        connection.executescript(
+            """
+            CREATE TABLE paper_trades_v7 (
+                id INTEGER PRIMARY KEY,
+                strategy TEXT NOT NULL CHECK (strategy IN ('breakout', 'trend_pullback', 'liquidity_sweep', 'opening_range_breakout')),
+                session_date TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL CHECK (side IN ('CE', 'PE')),
+                security_id INTEGER NOT NULL CHECK (security_id > 0),
+                signal_time TEXT NOT NULL,
+                entry_at TEXT,
+                reference_entry REAL NOT NULL,
+                stop_price REAL NOT NULL,
+                target_1 REAL NOT NULL,
+                target_2 REAL NOT NULL,
+                last_price REAL,
+                option_security_id INTEGER,
+                option_expiry TEXT,
+                option_instrument TEXT NOT NULL DEFAULT 'OPTSTK',
+                option_segment TEXT NOT NULL DEFAULT 'NSE_FNO',
+                option_entry_ltp REAL,
+                option_entry_bid REAL,
+                option_entry_ask REAL,
+                option_lot_size INTEGER,
+                signal_json TEXT,
+                data_capture_error TEXT,
+                status TEXT NOT NULL CHECK (
+                    status IN ('tracking', 'stop_before_t1', 't1_hit', 't2_hit',
+                               't1_then_breakeven', 'unresolved')
+                ),
+                target_1_at TEXT,
+                target_2_at TEXT,
+                stop_at TEXT,
+                last_candle_at TEXT,
+                tracking_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (strategy, session_date, symbol, side)
+            );
+            """
+        )
+        connection.execute(
+            f"INSERT INTO paper_trades_v7 ({col_list}) SELECT {col_list} FROM paper_trades"
+        )
+        connection.executescript(
+            """
+            DROP TABLE paper_trades;
+            ALTER TABLE paper_trades_v7 RENAME TO paper_trades;
+            """
+        )
 
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
@@ -897,9 +898,14 @@ def render_html(
     option_section = option_positions.render_section(option_rows or [], swing_funnel)
     multiframe_signals = multiframe_signals or []
     multiframe_errors = multiframe_errors or []
+    # Commit M: include liquidity_sweep and opening_range_breakout in the
+    # summary cards. Both strategies persist to paper_trades like breakout and
+    # trend_pullback, but prior HTML only summarized the first two - fires from
+    # liquidity_sweep (ASIANPAINT, INDIGO on 2026-11-02/03) were invisible on
+    # the dashboard until surfaced here.
     summaries = {
         name: _metrics([row for row in rows if row["strategy"] == name])
-        for name in ("breakout", "trend_pullback")
+        for name in ("breakout", "trend_pullback", "liquidity_sweep", "opening_range_breakout")
     }
     labels = {
         "tracking": "No target/stop yet",
@@ -1219,13 +1225,16 @@ def finalize_day(
 
     by_strategy = {
         name: _metrics([row for row in rows if row["strategy"] == name])
-        for name in ("breakout", "trend_pullback")
+        for name in ("breakout", "trend_pullback", "liquidity_sweep", "opening_range_breakout")
     }
+    def _wins_resolved(name):
+        return f"{by_strategy[name]['wins']}/{by_strategy[name]['resolved']}"
     caption = (
         f"Paper performance {session_date.isoformat()} IST | "
-        f"Breakout {by_strategy['breakout']['wins']}/{by_strategy['breakout']['resolved']} resolved T1 wins; "
-        f"Trend Pullback {by_strategy['trend_pullback']['wins']}/"
-        f"{by_strategy['trend_pullback']['resolved']} resolved T1 wins. "
+        f"Breakout {_wins_resolved('breakout')} T1 wins; "
+        f"Trend {_wins_resolved('trend_pullback')}; "
+        f"Sweep {_wins_resolved('liquidity_sweep')}; "
+        f"ORB {_wins_resolved('opening_range_breakout')}. "
         "Underlying-based tracking; no orders placed."
     )
     try:

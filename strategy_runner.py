@@ -15,6 +15,7 @@ import breakout_scanner as breakout
 import intraday_multiframe_strategy
 import trend_pullback
 import liquidity_sweep
+import opening_range_breakout
 import trade_performance
 import option_positions
 import swing_option_strategy
@@ -79,6 +80,15 @@ def run_cycle(dh, master, prep, universe, exclude, trend_expiry, day, now, fired
             liquidity_sweep.scan,
             (dh, master, prep, trimmed, day, now,
              fired.setdefault(liquidity_sweep.STRATEGY, set())),
+            {},
+        ))
+    if _at_or_before(now, opening_range_breakout.ENTRY_END):
+        trimmed = {s: sid for s, sid in universe.items() if s not in exclude}
+        scanners.append((
+            opening_range_breakout.STRATEGY,
+            opening_range_breakout.scan,
+            (dh, master, prep, trimmed, day, now,
+             fired.setdefault(opening_range_breakout.STRATEGY, set())),
             {},
         ))
     results = {}
@@ -307,6 +317,7 @@ def main():
         breakout.OUT / f"trend_pullback_signals_{day}.jsonl",
         breakout.OUT / f"daily_hourly_15m_signals_{day}.jsonl",
         breakout.OUT / f"liquidity_sweep_signals_{day}.jsonl",
+        breakout.OUT / f"opening_range_breakout_signals_{day}.jsonl",
     ):
         cross_fired |= load_fired_signals(signal_file)
     # Share one set across strategies: once any scanner has recommended
@@ -317,6 +328,7 @@ def main():
         "trend_pullback": cross_fired,
         "daily_hourly_15m": cross_fired,
         liquidity_sweep.STRATEGY: cross_fired,
+        opening_range_breakout.STRATEGY: cross_fired,
     }
 
     if args.once:
