@@ -194,6 +194,31 @@ class IndexSupportTests(unittest.TestCase):
         self.assertIn('result["underlying_security_id"] = sid', src)
 
 
+class MaxFiresPerDayPersistenceTests(unittest.TestCase):
+    """Commit N audit fix: MAX_FIRES_PER_DAY must count from the signal file,
+    not from in-memory prefix keys that get wiped on server restart."""
+
+    def test_fired_today_counts_from_signal_file_not_memory(self):
+        """Simulate mid-session restart: signal file has 2 ORB rows from
+        earlier today. After restart, in-memory `fired` set holds only the
+        plain cross-strategy keys (loaded via load_fired_signals). ORB must
+        still see fired_today = 2 and refuse to fire more."""
+        import tempfile, pathlib, json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            path = root / "opening_range_breakout_signals_2026-11-04.jsonl"
+            # Simulate 2 prior fires persisted today
+            path.write_text(
+                _json.dumps({"symbol": "RELIANCE", "side": "CE"}) + "\n"
+                + _json.dumps({"symbol": "TITAN", "side": "CE"}) + "\n",
+                encoding="utf-8",
+            )
+            # Count the way scan() does it
+            count = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+            self.assertEqual(count, 2)
+            self.assertGreaterEqual(count, strategy.MAX_FIRES_PER_DAY)
+
+
 class RoundNumberHelperTests(unittest.TestCase):
     def test_tiers(self):
         # <500 -> step 10

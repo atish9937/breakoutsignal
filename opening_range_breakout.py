@@ -530,9 +530,21 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
         return {"strategy": STRATEGY, "scan_time": current.strftime("%Y-%m-%d %H:%M:%S"),
                 "candidates_checked": 0, "results": [], "note": "outside entry window"}
 
-    # Per-day fire limit (counts entries for THIS strategy only)
-    day_key_prefix = f"{STRATEGY}:"
-    fired_today = sum(1 for k in fired if isinstance(k, str) and k.startswith(day_key_prefix))
+    # Per-day fire limit - count by reading the signal file directly so a
+    # server restart mid-session doesn't reset the counter. (Previous
+    # implementation stashed prefix keys in the shared `fired` set, but those
+    # don't persist across process restarts - a crash + restart could let ORB
+    # over-fire past MAX_FIRES_PER_DAY.)
+    signal_path = OUT / f"{STRATEGY}_signals_{day}.jsonl"
+    fired_today = 0
+    if signal_path.exists():
+        try:
+            fired_today = sum(
+                1 for line in signal_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+        except OSError:
+            fired_today = 0
     if fired_today >= MAX_FIRES_PER_DAY:
         return {"strategy": STRATEGY, "scan_time": current.strftime("%Y-%m-%d %H:%M:%S"),
                 "candidates_checked": 0, "results": [],
@@ -547,7 +559,6 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
 
     results: list[dict] = []
     stocks = prep.get("stocks") or {}
-    signal_path = OUT / f"{STRATEGY}_signals_{day}.jsonl"
 
     def _fire_if_ready(result: dict) -> None:
         nonlocal fired_today
@@ -575,7 +586,6 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
             print(f"ORB signal file write failed: {exc}", file=sys.stderr)
             return
         fired.add(key)
-        fired.add(f"{day_key_prefix}{key}")   # per-day fire counter
         fired_today += 1
         try:
             notify_signal(result)
