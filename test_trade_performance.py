@@ -288,6 +288,41 @@ class TradePerformanceTests(unittest.TestCase):
         self.assertEqual(dhan.intraday.call_count, 2)
         self.assertTrue(all(call.kwargs["interval"] == 1 for call in dhan.intraday.call_args_list))
 
+    def test_telegram_caption_includes_15min_strategy(self):
+        """Nov 6 2026: the 15m same-day strategy fired 4 signals with a
+        4/4 winning session but the Telegram caption only listed 4 strategies
+        (breakout / trend / sweep / ORB) and silently dropped the 15m line.
+        Drop one 15m signal into the report dir and verify the caption line
+        now includes '15m W/R'."""
+        import json as _json
+        signals_path = self.root / f"daily_hourly_15m_signals_{SESSION.isoformat()}.jsonl"
+        signals_path.write_text(
+            _json.dumps({
+                "strategy": "daily_hourly_15m",
+                "symbol": "AAA",
+                "side": "CE",
+                "signal_time": "2026-10-21T10:05:20+05:30",
+                "expiry": "2026-10-29",
+                "option": {"strike": 100, "bid": 10.0, "ask": 10.2, "lot_size": 50},
+                "underlying_entry": 100,
+                "underlying_stop": 95,
+                "underlying_target": 110,
+                "underlying_exit_reference": 110,
+                "option_exit_quote": {"bid": 11.5, "ask": 11.7},
+                "exit_reason": "underlying 2R target",
+                "exit_time": "2026-10-21T11:05:00+05:30",
+                "status": "paper_exit_signal_sent",
+            }) + "\n",
+            encoding="utf-8",
+        )
+        generated_at = dt.datetime(2026, 10, 21, 15, 10, tzinfo=IST)
+        with patch.object(performance, "send_html_report", return_value="42") as send:
+            performance.finalize_day(
+                self.connection, SESSION, self.root, "token", "chat", generated_at
+            )
+        caption = send.call_args.args[3]
+        self.assertIn("15m 1/1", caption)
+
     def test_failed_telegram_delivery_is_recorded_and_can_be_retried(self):
         generated_at = dt.datetime(2026, 10, 21, 15, 10, tzinfo=IST)
         with patch.object(

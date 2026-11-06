@@ -94,6 +94,19 @@ class BreakoutConfigTests(unittest.TestCase):
         import trend_pullback
         self.assertEqual(trend_pullback.MIN_T1_DISTANCE_PCT, 0.40)
 
+    def test_commit_q_nifty_chop_filter_defaults(self):
+        """Commit Q: block breakout + ORB fires when Nifty is simultaneously
+        near-flat (|chg_from_open| < 0.15%) AND tight-range (60-min range
+        < 0.50%). Nov 4 + Nov 5 2026 both showed the same failure pattern -
+        CE breakouts on neutral Nifty sessions all stopped out while the
+        lone liquidity_sweep fade won both days."""
+        self.assertEqual(breakout_scanner.CONFIG["nifty_chop_abs_chg_max_pct"], 0.15)
+        self.assertEqual(breakout_scanner.CONFIG["nifty_chop_range_max_pct"], 0.50)
+        # ORB mirrors the same thresholds via module-level constants.
+        import opening_range_breakout as orb
+        self.assertEqual(orb.NIFTY_CHOP_ABS_CHG_MAX_PCT, 0.15)
+        self.assertEqual(orb.NIFTY_CHOP_RANGE_MAX_PCT, 0.50)
+
 
 class PriorWeekAndMonthLevelsTests(unittest.TestCase):
     """Commit H: liquidity_sweep now also considers prior week + prior month

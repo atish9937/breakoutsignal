@@ -1229,12 +1229,27 @@ def finalize_day(
     }
     def _wins_resolved(name):
         return f"{by_strategy[name]['wins']}/{by_strategy[name]['resolved']}"
+
+    # 15-min same-day strategy lives in a JSONL (daily_hourly_15m_signals_*.jsonl),
+    # not in paper_trades, so compute its wins/resolved from the multiframe list.
+    # "Resolved" = any signal that recorded an exit; "win" = positive premium
+    # P&L using the same entry-ask / exit-bid basis the HTML table uses.
+    multiframe_resolved = sum(
+        1 for s in multiframe_signals if s.get("status") == "paper_exit_signal_sent"
+    )
+    multiframe_wins = sum(
+        1 for s in multiframe_signals
+        if s.get("status") == "paper_exit_signal_sent"
+        and (_multiframe_premium_estimate(s) or 0) > 0
+    )
+
     caption = (
         f"Paper performance {session_date.isoformat()} IST | "
         f"Breakout {_wins_resolved('breakout')} T1 wins; "
         f"Trend {_wins_resolved('trend_pullback')}; "
         f"Sweep {_wins_resolved('liquidity_sweep')}; "
-        f"ORB {_wins_resolved('opening_range_breakout')}. "
+        f"ORB {_wins_resolved('opening_range_breakout')}; "
+        f"15m {multiframe_wins}/{multiframe_resolved}. "
         "Underlying-based tracking; no orders placed."
     )
     try:

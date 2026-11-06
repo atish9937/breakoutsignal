@@ -90,6 +90,12 @@ T2_R = 2.0
 MIN_ADX = 20.0
 MAX_ADX = 55.0
 NIFTY_TREND_VETO_PCT = 0.30         # same as breakout + trend_pullback
+NIFTY_CHOP_ABS_CHG_MAX_PCT = 0.15   # Commit Q: block fires when BOTH |Nifty chg_from_open| < this
+NIFTY_CHOP_RANGE_MAX_PCT = 0.50     # AND the 60-min range is below NIFTY_CHOP_RANGE_MAX_PCT.
+                                     # Nov 5 2026: both TITAN + BANKBARODA CE ORB fires stopped out
+                                     # on a Nifty +0.17% / 60-min-range 0.29% day; the breakout bars
+                                     # themselves looked clean (upper wick 0.12-0.20, below the
+                                     # Commit P fade threshold). Chop-regime block catches these.
 BREADTH_MIN_PCT_FOR_CE = 55.0
 BREADTH_MAX_PCT_FOR_PE = 45.0
 VIX_SPIKE_MULTIPLIER = 1.30
@@ -313,6 +319,23 @@ def evaluate_setup(symbol: str, candles: pd.DataFrame, now: dt.datetime,
         nifty_trend_text = f"Nifty {nifty_chg:+.2f}% aligned with {side}"
     _record(checks, "Nifty intraday trend", nifty_trend_text,
             f"within +/-{NIFTY_TREND_VETO_PCT:.2f}% or aligned", nifty_trend_ok)
+
+    # Commit Q: Nifty chop-regime veto (mirrors breakout_scanner).
+    nifty_chg_from_open = (nifty_bias or {}).get("chg_from_open_pct")
+    nifty_range_60m = (nifty_bias or {}).get("range_pct_60min")
+    if nifty_chg_from_open is None or nifty_range_60m is None:
+        chop_ok = True
+        chop_text = "Nifty chg_from_open or 60-min range unavailable"
+    else:
+        is_chop = (abs(nifty_chg_from_open) < NIFTY_CHOP_ABS_CHG_MAX_PCT
+                   and nifty_range_60m < NIFTY_CHOP_RANGE_MAX_PCT)
+        chop_ok = not is_chop
+        chop_text = (f"Nifty chg_from_open {nifty_chg_from_open:+.2f}%, "
+                     f"60-min range {nifty_range_60m:.2f}%")
+    _record(checks, "Nifty regime (chop filter)", chop_text,
+            f"NOT (|chg_from_open| < {NIFTY_CHOP_ABS_CHG_MAX_PCT:.2f}% "
+            f"AND 60-min range < {NIFTY_CHOP_RANGE_MAX_PCT:.2f}%)",
+            chop_ok)
 
     # Market breadth
     breadth_pct = (breadth or {}).get("pct_above_prev_close")

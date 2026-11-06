@@ -223,6 +223,12 @@ CONFIG = {
     "nifty_trend_veto_pct": 0.30,     # Commit J: when Nifty chg_pct > +0.30% block PE / < -0.30% block CE
                                        # closes the 2026-10-30 failure mode where 4 PE signals fired
                                        # on a +0.4% Nifty day with lukewarm breadth (42-45%)
+    "nifty_chop_abs_chg_max_pct": 0.15,  # Commit Q: when |Nifty chg_pct from open| < this AND the
+    "nifty_chop_range_max_pct": 0.50,    # 60-min range < nifty_chop_range_max_pct, treat the index
+                                         # as CHOP and block new breakout fires (both CE and PE).
+                                         # Nov 4 + Nov 5 2026 each produced 2 losing CE breakouts on
+                                         # a near-flat Nifty (<0.20% from open, 60-min range <0.35%);
+                                         # the only winners on both days were liquidity_sweep fades.
     "vix_spike_multiplier": 1.30,     # veto new entries when India VIX > 1.30 * its own 20-day EMA
     "entry_start": "09:30",
     "entry_cutoff": "12:30",
@@ -884,11 +890,26 @@ def nifty_bias(dh: Dhan, quotes: dict, day: dt.date, now: dt.datetime) -> dict:
     o = (q.get("ohlc") or {}).get("open")
     pc = (q.get("ohlc") or {}).get("close")
     e9 = e21 = None
+    range_pct_60min = None
+    chg_from_open_pct = None
     try:
         n5 = dh.intraday(NIFTY_ID, dt.datetime.combine(day - dt.timedelta(days=4), dt.time(9, 15), IST), now,
                          seg="IDX_I", inst="INDEX")
         if len(n5) > 21:
             e9, e21 = float(ema(n5["close"], 9).iloc[-1]), float(ema(n5["close"], 21).iloc[-1])
+        # Commit Q: 60-min range for the chop filter. 12 bars of 5-min data =
+        # 60 min; use fewer if the session is still young (first hour of trade).
+        today_bars = n5[n5.index.date == day] if len(n5) else n5
+        if len(today_bars) >= 1:
+            window = today_bars.tail(12)
+            win_high = float(window["high"].max())
+            win_low = float(window["low"].min())
+            ref_close = float(window["close"].iloc[-1])
+            if ref_close > 0:
+                range_pct_60min = (win_high - win_low) / ref_close * 100
+                today_open = float(today_bars["open"].iloc[0])
+                if today_open > 0:
+                    chg_from_open_pct = (ref_close / today_open - 1) * 100
     except DhanAuthError:
         raise
     except Exception:  # noqa: BLE001
@@ -901,6 +922,8 @@ def nifty_bias(dh: Dhan, quotes: dict, day: dt.date, now: dt.datetime) -> dict:
             bias = "DOWN"
     return {"ltp": r2(ltp), "open": r2(o), "prev_close": r2(pc),
             "chg_pct": r2((ltp / pc - 1) * 100) if ltp and pc else None,
+            "chg_from_open_pct": r2(chg_from_open_pct),
+            "range_pct_60min": r2(range_pct_60min),
             "ema9_5m": r2(e9), "ema21_5m": r2(e21), "bias": bias}
 
 
@@ -1132,6 +1155,35 @@ def evaluate(dh, master, prep, sym, side, q, nifty, now, day, want_chain=True,
         nifty_trend_ok,
     )
     (passes if nifty_trend_ok else fails).append(nifty_trend_text)
+
+    # Commit Q: Nifty chop-regime veto. The existing Nifty-trend gate blocks
+    # fires that OPPOSE a directional index, but it lets flat-Nifty days pass
+    # (|chg_pct| < 0.30%). On Nov 4 + Nov 5 2026 the index was <0.20% from
+    # open with a 60-min range <0.35% - 4 of 5 breakout/ORB fires on those
+    # two days lost. Block fires when BOTH the magnitude is tiny AND the
+    # 60-min range is tight; let anything trending through.
+    nifty_chg_from_open = nifty.get("chg_from_open_pct")
+    nifty_range_60m = nifty.get("range_pct_60min")
+    chop_abs_cap = CONFIG["nifty_chop_abs_chg_max_pct"]
+    chop_range_cap = CONFIG["nifty_chop_range_max_pct"]
+    if nifty_chg_from_open is None or nifty_range_60m is None:
+        chop_ok = True
+        chop_text = "chg_from_open or 60-min range unavailable"
+    else:
+        is_chop = (abs(nifty_chg_from_open) < chop_abs_cap
+                   and nifty_range_60m < chop_range_cap)
+        chop_ok = not is_chop
+        chop_text = (
+            f"Nifty chg_from_open {nifty_chg_from_open:+.2f}%, "
+            f"60-min range {nifty_range_60m:.2f}%"
+        )
+    record_check(
+        "Nifty regime (chop filter)",
+        chop_text,
+        f"NOT (|chg_from_open| < {chop_abs_cap:.2f}% AND 60-min range < {chop_range_cap:.2f}%)",
+        chop_ok,
+    )
+    (passes if chop_ok else fails).append(chop_text)
 
     # Prior-day H/L alignment - a true breakout trades beyond the prior session's extreme.
     prev_level = p.get("prev_high") if side == "CE" else p.get("prev_low")

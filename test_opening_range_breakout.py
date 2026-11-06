@@ -168,6 +168,98 @@ class ORBConfigTests(unittest.TestCase):
         self.assertEqual(strategy.MIN_T1_DISTANCE_PCT, 0.40)
 
 
+class NiftyChopFilterTests(unittest.TestCase):
+    """Commit Q: block fires when Nifty is near-flat AND tight-range.
+    Reconstructed from Nov 5 2026 TITAN/BANKBARODA CE losses: Nifty was
+    +0.17% from open with a 60-min range of 0.29% - both inside the chop
+    band, both fires should have been skipped."""
+
+    def _clean_ce_breakout_bars(self):
+        """6 OR bars [99,108] + 1 breakout close 113 (above OR_high=108)."""
+        or_closes = [102, 104, 106, 103, 101, 105]
+        or_highs =  [103, 105, 108, 104, 102, 106]
+        or_lows =   [100, 102, 103, 102, 99,  104]
+        post_closes = [113]
+        post_highs = [114]
+        post_lows = [107]
+        post_volumes = [2000]
+        closes = or_closes + post_closes
+        highs = or_highs + post_highs
+        lows = or_lows + post_lows
+        volumes = [1000] * 6 + post_volumes
+        idx = pd.date_range("2026-11-05 09:15", periods=len(closes), freq="5min", tz=IST)
+        return pd.DataFrame({
+            "open": closes, "high": highs, "low": lows, "close": closes, "volume": volumes,
+        }, index=idx)
+
+    def test_chop_regime_blocks_ce_breakout(self):
+        """|chg_from_open| 0.17% < 0.15% is FALSE (0.17 > 0.15), so this
+        particular shape would NOT be chop. Use 0.10% / 0.29% range (true chop)."""
+        df = self._clean_ce_breakout_bars()
+        now = df.index[-1].to_pydatetime() + dt.timedelta(seconds=20)
+        with patch.object(core, "atr", return_value=1.0), \
+                patch.object(core, "adx", return_value=25.0), \
+                patch.object(core, "macd_hist", return_value=0.5):
+            result = strategy.evaluate_setup(
+                "TEST", df, now,
+                prev_high=109.0, prev_low=99.0,
+                nifty_bias={"bias": "FLAT", "chg_pct": 0.10,
+                            "chg_from_open_pct": 0.10,
+                            "range_pct_60min": 0.29},
+                vix={"ltp": 15.0, "ema20": 15.0},
+                breadth={"pct_above_prev_close": 65.0},
+            )
+        # Chop filter must have fired; verdict demoted below SETUP.
+        chop_check = next((c for c in result["mechanical_checks"]
+                           if c["gate"] == "Nifty regime (chop filter)"), None)
+        self.assertIsNotNone(chop_check)
+        self.assertFalse(chop_check["passed"])
+        self.assertIn("Nifty regime (chop filter)", result["fails"])
+
+    def test_trending_regime_allows_ce_breakout(self):
+        """|chg_from_open| 0.40% (above 0.15%) OR range 0.80% (above 0.50%).
+        Either exceeds the chop band -> the gate passes."""
+        df = self._clean_ce_breakout_bars()
+        now = df.index[-1].to_pydatetime() + dt.timedelta(seconds=20)
+        with patch.object(core, "atr", return_value=1.0), \
+                patch.object(core, "adx", return_value=25.0), \
+                patch.object(core, "macd_hist", return_value=0.5):
+            result = strategy.evaluate_setup(
+                "TEST", df, now,
+                prev_high=109.0, prev_low=99.0,
+                nifty_bias={"bias": "UP", "chg_pct": 0.40,
+                            "chg_from_open_pct": 0.40,
+                            "range_pct_60min": 0.80},
+                vix={"ltp": 15.0, "ema20": 15.0},
+                breadth={"pct_above_prev_close": 65.0},
+            )
+        chop_check = next((c for c in result["mechanical_checks"]
+                           if c["gate"] == "Nifty regime (chop filter)"), None)
+        self.assertIsNotNone(chop_check)
+        self.assertTrue(chop_check["passed"])
+        self.assertEqual(result["verdict"], "SETUP_CE")
+
+    def test_missing_regime_data_defaults_to_pass(self):
+        """If nifty_bias lacks chg_from_open_pct/range_pct_60min (e.g. pre-Commit-Q
+        code path or Dhan returned nothing), the gate must not block."""
+        df = self._clean_ce_breakout_bars()
+        now = df.index[-1].to_pydatetime() + dt.timedelta(seconds=20)
+        with patch.object(core, "atr", return_value=1.0), \
+                patch.object(core, "adx", return_value=25.0), \
+                patch.object(core, "macd_hist", return_value=0.5):
+            result = strategy.evaluate_setup(
+                "TEST", df, now,
+                prev_high=109.0, prev_low=99.0,
+                nifty_bias={"bias": "FLAT", "chg_pct": 0.0},
+                vix={"ltp": 15.0, "ema20": 15.0},
+                breadth={"pct_above_prev_close": 65.0},
+            )
+        chop_check = next((c for c in result["mechanical_checks"]
+                           if c["gate"] == "Nifty regime (chop filter)"), None)
+        self.assertIsNotNone(chop_check)
+        self.assertTrue(chop_check["passed"])
+
+
 class BreakoutBarExhaustionFlipTests(unittest.TestCase):
     """Commit P: A breakout bar that closes beyond the OR but leaves a large
     wick in its own breakout direction is a stop-run, not a continuation. ORB
