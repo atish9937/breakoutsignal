@@ -72,6 +72,14 @@ ENTRY_END = dt.time(11, 0)
 # Breakout bar criteria
 MIN_PENETRATION_ATR = 0.20          # close beyond OR boundary by >= this * ATR
 MIN_VOLUME_RATIO = 1.5              # breakout bar volume >= this * 20-bar avg
+FADE_WICK_RATIO = 0.40              # Commit P: if the breakout bar leaves a wick >= this
+                                    # fraction of its range in its OWN breakout direction,
+                                    # the move is an exhaustion stop-run. Flip the trade to
+                                    # the opposite side and anchor the stop at the rejected
+                                    # extreme. Nov 4 HDFCAMC CE fired at 2519.10 within
+                                    # 0.22% of the day's high 2524.70 - a classic chase; a
+                                    # dominant upper wick on that bar would have flipped
+                                    # the setup to PE.
 
 # Risk
 STOP_WICK_BUFFER_ATR = 0.10
@@ -213,10 +221,41 @@ def evaluate_setup(symbol: str, candles: pd.DataFrame, now: dt.datetime,
         result["fails"].append("no OR breakout")
         return result
 
+    # Commit P: breakout-bar exhaustion flip. If the bar that broke the OR
+    # leaves a dominant wick on its own breakout side, the bar is a stop-run,
+    # not continuation. Flip to the opposite side; the downstream direction
+    # gates (MACD, breadth, prior-day H/L, Nifty bias) then re-evaluate
+    # against the fade direction and will veto if the broader regime still
+    # favors the original move (which is the correct conservative behavior).
+    bar_open = float(bar["open"])
+    bar_range = high - low
+    upper_wick_ratio = (high - max(close, bar_open)) / bar_range if bar_range > 0 else 0.0
+    lower_wick_ratio = (min(close, bar_open) - low) / bar_range if bar_range > 0 else 0.0
+    rejection_wick = upper_wick_ratio if side == "CE" else lower_wick_ratio
+    flipped_from_exhaustion = False
+    original_side = side
+    if rejection_wick >= FADE_WICK_RATIO:
+        flipped_from_exhaustion = True
+        if side == "CE":
+            side = "PE"
+            bar_extreme = high
+        else:
+            side = "CE"
+            bar_extreme = low
+
     sign = 1 if side == "CE" else -1
+    flip_note = (f" -> flipped to {side} (exhaustion wick)"
+                 if flipped_from_exhaustion else "")
     _record(checks, "OR breakout",
-            f"{side}: close {close:.2f} beyond {boundary:.2f} by {penetration:.2f}x ATR",
+            f"{original_side}: close {close:.2f} beyond {boundary:.2f} by "
+            f"{penetration:.2f}x ATR{flip_note}",
             f"close beyond OR boundary by >= {MIN_PENETRATION_ATR}x ATR",
+            True)
+    _record(checks, "Breakout bar rejection",
+            f"{'upper' if original_side == 'CE' else 'lower'} wick "
+            f"{rejection_wick:.2f} of range"
+            + (" -> side flipped" if flipped_from_exhaustion else " -> no flip"),
+            f"< {FADE_WICK_RATIO:.2f} else flip (either way is a valid state)",
             True)
 
     volume_ok = vol_ratio >= MIN_VOLUME_RATIO
@@ -353,6 +392,9 @@ def evaluate_setup(symbol: str, candles: pd.DataFrame, now: dt.datetime,
         "or_low": core.r2(or_low),
         "breakout_bar_volume_ratio": round(vol_ratio, 2),
         "penetration_atr": round(penetration, 3),
+        "breakout_bar_upper_wick_ratio": round(upper_wick_ratio, 3),
+        "breakout_bar_lower_wick_ratio": round(lower_wick_ratio, 3),
+        "flipped_from_exhaustion": flipped_from_exhaustion,
         "plan": {
             "entry": core.r2(close),
             "stop": core.r2(stop),
@@ -508,8 +550,10 @@ def _notify(text: str) -> None:
 
 def notify_signal(result: dict) -> None:
     opt, plan = result["option"], result["plan"]
+    flip_tag = " [EXHAUSTION FLIP]" if result.get("flipped_from_exhaustion") else ""
     _notify(
-        f"[OR Breakout] {result['verdict']} {result['symbol']} underlying {result['ltp']}\n"
+        f"[OR Breakout]{flip_tag} {result['verdict']} {result['symbol']} "
+        f"underlying {result['ltp']}\n"
         f"OR [{result['or_low']}, {result['or_high']}] breakout "
         f"({result['penetration_atr']:.2f}x ATR, vol {result['breakout_bar_volume_ratio']:.2f}x)\n"
         f"{opt['contract']} [{opt['selection']}] ~Rs{opt['premium']} | lot {opt['lot_size']}\n"

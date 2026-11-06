@@ -66,9 +66,10 @@ SWEEP_PENETRATION_ATR = 0.30       # Commit F: raised from 0.10 - 7 of 11 stops 
                                    # 5-day backtest were shallow pokes (pen < 0.5 ATR)
                                    # during ADX>25 regimes, which are usually trend
                                    # continuation, not stop-hunt reversals
-SWEEP_WICK_RATIO = 0.65            # Commit M: raised 0.50 -> 0.65 after Nov 3 INDIGO sweep
-                                   # fired with wick 0.516 - just barely over the old threshold,
-                                   # visually weak. 0.65 keeps only decisively wick-dominant sweeps.
+SWEEP_WICK_RATIO = 0.70            # Commit P: raised 0.65 -> 0.70 after Nov 4 review.
+                                   # ADANIPORTS PE (wick 0.947) was the only cleanly profitable
+                                   # sweep that day; 0.70 keeps the strongly rejected sweeps and
+                                   # filters borderline wicks that behave more like breakouts.
 SWEEP_VOLUME_RATIO = 1.3           # sweep bar volume >= this * 20-bar avg
 
 # Confirmation bar

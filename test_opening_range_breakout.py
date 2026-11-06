@@ -161,10 +161,98 @@ class ORBConfigTests(unittest.TestCase):
         self.assertEqual(strategy.MIN_PENETRATION_ATR, 0.20)
         self.assertEqual(strategy.MIN_VOLUME_RATIO, 1.5)
         self.assertEqual(strategy.MAX_FIRES_PER_DAY, 2)
+        self.assertEqual(strategy.FADE_WICK_RATIO, 0.40)
         # Option gates match the other strategies
         self.assertEqual(strategy.OPTION_MIN_DELTA, 0.25)
         self.assertEqual(strategy.OPTION_MIN_DTE_DAYS, 5)
         self.assertEqual(strategy.MIN_T1_DISTANCE_PCT, 0.40)
+
+
+class BreakoutBarExhaustionFlipTests(unittest.TestCase):
+    """Commit P: A breakout bar that closes beyond the OR but leaves a large
+    wick in its own breakout direction is a stop-run, not a continuation. ORB
+    flips the side so downstream direction gates re-evaluate against the fade
+    direction (and will still veto if the regime favors the original move)."""
+
+    def _build(self, breakout_close, breakout_high, breakout_low, breakout_open):
+        # OR: 09:15-09:40 in [99, 108]
+        or_closes = [102, 104, 106, 103, 101, 105]
+        or_highs =  [103, 105, 108, 104, 102, 106]
+        or_lows =   [100, 102, 103, 102, 99,  104]
+        closes = or_closes + [breakout_close]
+        highs = or_highs + [breakout_high]
+        lows = or_lows + [breakout_low]
+        opens = or_closes + [breakout_open]
+        volumes = [1000] * 6 + [2000]
+        idx = pd.date_range("2026-11-04 09:15", periods=len(closes), freq="5min", tz=IST)
+        return pd.DataFrame({
+            "open": opens, "high": highs, "low": lows, "close": closes, "volume": volumes,
+        }, index=idx)
+
+    def test_ce_breakout_with_dominant_upper_wick_flips_to_pe(self):
+        """Close above OR_high but bar's upper wick is >= FADE_WICK_RATIO
+        of its range -> side flips from CE to PE, stop anchors to bar high."""
+        # Close 113 (above OR_high 108), high 120, low 108, open 113
+        # upper wick = (120 - max(113, 113)) / (120 - 108) = 7/12 = 0.583 >= 0.40
+        df = self._build(breakout_close=113, breakout_high=120,
+                         breakout_low=108, breakout_open=113)
+        now = df.index[-1].to_pydatetime() + dt.timedelta(seconds=20)
+        # Supply neutral regime so downstream direction gates won't veto PE
+        with patch.object(core, "atr", return_value=1.0), \
+                patch.object(core, "adx", return_value=25.0), \
+                patch.object(core, "macd_hist", return_value=-0.5):
+            result = strategy.evaluate_setup(
+                "TEST", df, now,
+                prev_high=115.0, prev_low=112.0,
+                nifty_bias={"bias": "FLAT", "chg_pct": 0.0},
+                vix={"ltp": 15.0, "ema20": 15.0},
+                breadth={"pct_above_prev_close": 40.0},
+            )
+        self.assertTrue(result["flipped_from_exhaustion"])
+        self.assertEqual(result["side"], "PE")
+        # Stop is bar_high + buffer (ATR=1, buffer=0.10) = 120.10
+        self.assertGreater(result["plan"]["stop"], 120.0)
+
+    def test_pe_breakout_with_dominant_lower_wick_flips_to_ce(self):
+        """Close below OR_low but bar's lower wick is >= FADE_WICK_RATIO
+        of its range -> side flips from PE to CE, stop anchors to bar low."""
+        # Close 95 (below OR_low 99), high 99, low 85, open 95
+        # lower wick = (min(95, 95) - 85) / (99 - 85) = 10/14 = 0.714 >= 0.40
+        df = self._build(breakout_close=95, breakout_high=99,
+                         breakout_low=85, breakout_open=95)
+        now = df.index[-1].to_pydatetime() + dt.timedelta(seconds=20)
+        with patch.object(core, "atr", return_value=1.0), \
+                patch.object(core, "adx", return_value=25.0), \
+                patch.object(core, "macd_hist", return_value=0.5):
+            result = strategy.evaluate_setup(
+                "TEST", df, now,
+                prev_high=98.0, prev_low=86.0,
+                nifty_bias={"bias": "FLAT", "chg_pct": 0.0},
+                vix={"ltp": 15.0, "ema20": 15.0},
+                breadth={"pct_above_prev_close": 60.0},
+            )
+        self.assertTrue(result["flipped_from_exhaustion"])
+        self.assertEqual(result["side"], "CE")
+        self.assertLess(result["plan"]["stop"], 85.0)
+
+    def test_clean_breakout_without_rejection_wick_does_not_flip(self):
+        """Close 113, high 114, low 108, open 108 -> upper wick tiny,
+        side stays CE."""
+        df = self._build(breakout_close=113, breakout_high=114,
+                         breakout_low=108, breakout_open=108)
+        now = df.index[-1].to_pydatetime() + dt.timedelta(seconds=20)
+        with patch.object(core, "atr", return_value=1.0), \
+                patch.object(core, "adx", return_value=25.0), \
+                patch.object(core, "macd_hist", return_value=0.5):
+            result = strategy.evaluate_setup(
+                "TEST", df, now,
+                prev_high=109.0, prev_low=99.0,
+                nifty_bias={"bias": "UP", "chg_pct": 0.4},
+                vix={"ltp": 15.0, "ema20": 15.0},
+                breadth={"pct_above_prev_close": 65.0},
+            )
+        self.assertFalse(result["flipped_from_exhaustion"])
+        self.assertEqual(result["side"], "CE")
 
 
 class IndexSupportTests(unittest.TestCase):
