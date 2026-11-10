@@ -224,6 +224,86 @@ class EvaluateSetupTests(unittest.TestCase):
         self.assertIn("sweep", result)
         self.assertIn("confirmation", result)
 
+    def test_displacement_block_writes_shadow_log(self):
+        """Commit S: when sweep bar passes but displacement confirmation fails,
+        a row must be written to the shadow log so future review can replay
+        the post-block price path."""
+        import tempfile, pathlib, json as _json
+        # Build a bearish sweep whose CONFIRMATION bar is too weak.
+        prev = _flat_bars(25); prev["volume"] = 1000
+        prev.loc[prev.index[10], "high"] = 110.0
+        sweep_idx = prev.index[-1] + pd.Timedelta(minutes=5)
+        confirm_idx = sweep_idx + pd.Timedelta(minutes=5)
+        sweep = pd.DataFrame({
+            "open": [109.5], "high": [112.0], "low": [109.0],
+            "close": [109.5], "volume": [2000]
+        }, index=[sweep_idx])
+        # Confirmation bar: tiny body (0.00x ATR since open == close), doji
+        # -> displacement gate must FAIL and log must be written.
+        confirm = pd.DataFrame({
+            "open": [109.5], "high": [109.6], "low": [109.4],
+            "close": [109.5], "volume": [2000]
+        }, index=[confirm_idx])
+        candles = pd.concat([prev, sweep, confirm])
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = pathlib.Path(tmp)
+            orig_out = strategy.OUT
+            strategy.OUT = tmp_root
+            try:
+                now = candles.index[-1].to_pydatetime() + dt.timedelta(seconds=20)
+                with patch.object(core, "atr", return_value=1.0), \
+                        patch.object(core, "adx", return_value=25.0):
+                    result = strategy.evaluate_setup(
+                        "TEST", candles, now,
+                        prev_high=110.0, prev_low=90.0,
+                        nifty_bias={"bias": "DOWN"},
+                        vix={"ltp": 15.0, "ema20": 15.0},
+                    )
+                self.assertEqual(result["verdict"], "WATCH_PE")
+                self.assertIn("confirmation failed", result["fails"])
+                day = now.astimezone(core.IST).date()
+                log_path = tmp_root / f"liquidity_sweep_displacement_blocked_{day}.jsonl"
+                self.assertTrue(log_path.exists(), "shadow log file must be created")
+                rows = [_json.loads(l) for l in log_path.read_text().splitlines() if l.strip()]
+                self.assertEqual(len(rows), 1)
+                r = rows[0]
+                self.assertEqual(r["symbol"], "TEST")
+                self.assertEqual(r["side"], "PE")
+                self.assertIn("sweep", r)
+                self.assertIn("sweep_bar", r)
+                self.assertIn("confirmation_bar", r)
+                # sweep_bar fields must be real floats pulled from the bar
+                self.assertEqual(r["sweep_bar"]["high"], 112.0)
+                self.assertEqual(r["confirmation_bar"]["close"], 109.5)
+            finally:
+                strategy.OUT = orig_out
+
+    def test_no_shadow_log_when_sweep_gate_itself_fails(self):
+        """A pure no-sweep SKIP must NOT write the shadow log (that's reserved
+        for the sweep-passed-but-displacement-failed case)."""
+        import tempfile, pathlib
+        candles = _flat_bars(30); candles["volume"] = 1000
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = pathlib.Path(tmp)
+            orig_out = strategy.OUT
+            strategy.OUT = tmp_root
+            try:
+                now = candles.index[-1].to_pydatetime() + dt.timedelta(seconds=20)
+                with patch.object(core, "atr", return_value=1.0), \
+                        patch.object(core, "adx", return_value=15.0):
+                    result = strategy.evaluate_setup(
+                        "TEST", candles, now,
+                        prev_high=120.0, prev_low=80.0,
+                        nifty_bias={"bias": "FLAT"},
+                        vix={"ltp": 15.0, "ema20": 15.0},
+                    )
+                self.assertEqual(result["verdict"], "SKIP")
+                # No files whatsoever under displacement_blocked prefix
+                blocked_files = list(tmp_root.glob("liquidity_sweep_displacement_blocked_*.jsonl"))
+                self.assertEqual(blocked_files, [])
+            finally:
+                strategy.OUT = orig_out
+
     def test_flat_market_produces_no_sweep(self):
         """Pure sideways price action should not trigger a sweep."""
         candles = _flat_bars(30)

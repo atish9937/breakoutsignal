@@ -113,6 +113,64 @@ INDICES = {
 OUT = core.OUT
 
 
+def _log_displacement_block(symbol: str, side: str, sweep: dict,
+                             sweep_bar, confirmation_bar, confirmation: dict,
+                             atr_value: float, now: dt.datetime) -> None:
+    """Commit S: shadow log for sweep bars that passed the sweep gate but
+    failed displacement confirmation. Observability-only - no behavior change.
+
+    Nov 4 session: 9 sweeps with wick in [0.65, 0.70) were blocked at
+    displacement; 8 of those failed because the confirmation bar had body
+    < 0.5x ATR. Nov 9 session: 5 sweeps with wick in [0.70, 0.84] were
+    similarly blocked. We don't know yet whether relaxing the body threshold
+    would admit winners or false positives - this log captures the raw bars
+    so future review can replay the post-block price path and decide.
+    """
+    try:
+        day = now.astimezone(core.IST).date()
+    except Exception:  # noqa: BLE001
+        day = now.date() if hasattr(now, "date") else None
+    if day is None:
+        return
+    path = OUT / f"{STRATEGY}_displacement_blocked_{day}.jsonl"
+    path.parent.mkdir(exist_ok=True)
+    try:
+        sweep_ts = sweep_bar.name.isoformat() if hasattr(sweep_bar.name, "isoformat") else str(sweep_bar.name)
+        conf_ts = confirmation_bar.name.isoformat() if hasattr(confirmation_bar.name, "isoformat") else str(confirmation_bar.name)
+    except Exception:  # noqa: BLE001
+        sweep_ts = conf_ts = None
+    row = {
+        "symbol": symbol,
+        "side": side,
+        "scan_time": now.isoformat(),
+        "atr_value": round(float(atr_value), 4) if atr_value else None,
+        "sweep": sweep,
+        "sweep_bar": {
+            "time": sweep_ts,
+            "open": float(sweep_bar["open"]),
+            "high": float(sweep_bar["high"]),
+            "low": float(sweep_bar["low"]),
+            "close": float(sweep_bar["close"]),
+            "volume": float(sweep_bar["volume"]),
+        },
+        "confirmation_bar": {
+            "time": conf_ts,
+            "open": float(confirmation_bar["open"]),
+            "high": float(confirmation_bar["high"]),
+            "low": float(confirmation_bar["low"]),
+            "close": float(confirmation_bar["close"]),
+            "volume": float(confirmation_bar["volume"]),
+        },
+        "confirmation_measurements": confirmation,
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row) + "\n")
+            stream.flush()
+    except OSError as exc:
+        print(f"liquidity_sweep shadow log write failed: {exc}", file=sys.stderr)
+
+
 def _record(checks: list, name: str, current: str, criterion: str, passed: bool) -> bool:
     checks.append({
         "gate": name,
@@ -475,6 +533,16 @@ def evaluate_setup(symbol: str, candles: pd.DataFrame, now: dt.datetime,
         ok,
     )
     if not ok:
+        # Commit S: shadow log so future review can retrospectively verify
+        # whether the displacement gate is too strict. Observability-only.
+        try:
+            _log_displacement_block(
+                symbol, side, sweep, sweep_bar, confirmation_bar,
+                confirmation, atr_value, now,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"displacement-block log failed for {symbol}: {exc}",
+                  file=sys.stderr)
         result["side"] = side
         result["verdict"] = f"WATCH_{side}"
         result["fails"].append("confirmation failed")
