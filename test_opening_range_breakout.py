@@ -412,5 +412,131 @@ class RoundNumberHelperTests(unittest.TestCase):
         self.assertEqual(strategy._nearest_round_numbers(5250)[0], 5300)
 
 
+class ReverseWatchTests(unittest.TestCase):
+    """Commit R: ORB reverse-watch. When a primary ORB fire's stop is broken
+    within the watch window, the scanner fires a symmetric-R flip through the
+    full regime gate stack. Rationale (Nov 4/5/9 pattern): 5/5 ORB stop-outs
+    across 3 trading days + 2 regimes would have been clean T1 wins if
+    flipped. See followup_reverse_watch_feature.md."""
+
+    def setUp(self):
+        import tempfile, pathlib
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self._orig_out = strategy.OUT
+        strategy.OUT = self.root
+
+    def tearDown(self):
+        strategy.OUT = self._orig_out
+        self.tmp.cleanup()
+
+    def _sample_watch(self, side="CE", now=None, expires_mins=60, reversed_=False):
+        now = now or dt.datetime(2026, 11, 9, 10, 40, tzinfo=IST)
+        return {
+            "symbol": "TEST",
+            "original_side": side,
+            "original_entry": 100.0,
+            "original_stop": 95.0 if side == "CE" else 105.0,
+            "original_t1": 105.0 if side == "CE" else 95.0,
+            "original_t2": 110.0 if side == "CE" else 90.0,
+            "fire_time": now.isoformat(),
+            "atr_5m": 2.0,
+            "security_id": 42,
+            "underlying_security_id": 101,
+            "expires_at": (now + dt.timedelta(minutes=expires_mins)).isoformat(),
+            "reversed": reversed_,
+        }
+
+    def test_watch_roundtrip_through_load_and_save(self):
+        day = dt.date(2026, 11, 9)
+        strategy._save_watches(day, [self._sample_watch()])
+        loaded = strategy._load_watches(day)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["symbol"], "TEST")
+        self.assertEqual(loaded[0]["original_side"], "CE")
+        self.assertFalse(loaded[0]["reversed"])
+
+    def test_reverse_setup_flips_side_and_computes_symmetric_plan(self):
+        """Stop broken on a CE watch -> flipped PE result with:
+        new entry = original stop, new stop = original entry, T1/T2 mirrored."""
+        watch = self._sample_watch(side="CE")
+        # Trending-down regime so the flipped PE passes the Nifty-trend gate
+        nifty = {"bias": "DOWN", "chg_pct": -0.5,
+                 "chg_from_open_pct": -0.5, "range_pct_60min": 0.9}
+        now = dt.datetime(2026, 11, 9, 10, 52, tzinfo=IST)
+        result = strategy._evaluate_reverse_setup(
+            watch, current_ltp=94.5, now=now,
+            nifty_bias=nifty,
+            vix={"ltp": 15.0, "ema20": 15.0},
+            breadth={"pct_above_prev_close": 35.0},
+        )
+        self.assertEqual(result["side"], "PE")
+        self.assertEqual(result["reverse_of"], "CE")
+        plan = result["plan"]
+        # Entry anchored at original stop (95), new stop at original entry (100)
+        self.assertEqual(plan["entry"], 95.0)
+        self.assertEqual(plan["stop"], 100.0)
+        # Symmetric: T1 at 90 (1R below entry), T2 at 85 (2R below entry)
+        self.assertEqual(plan["t1"], 90.0)
+        self.assertEqual(plan["t2"], 85.0)
+        self.assertEqual(result["verdict"], "SETUP_PE")
+
+    def test_reverse_setup_pe_watch_flips_to_ce(self):
+        """Mirror test: PE watch -> stop broken upward -> CE flip."""
+        watch = self._sample_watch(side="PE")
+        # Trending-up regime so flipped CE passes
+        nifty = {"bias": "UP", "chg_pct": 0.5,
+                 "chg_from_open_pct": 0.5, "range_pct_60min": 0.9}
+        now = dt.datetime(2026, 11, 9, 11, 10, tzinfo=IST)
+        result = strategy._evaluate_reverse_setup(
+            watch, current_ltp=105.5, now=now,
+            nifty_bias=nifty,
+            vix={"ltp": 15.0, "ema20": 15.0},
+            breadth={"pct_above_prev_close": 65.0},
+        )
+        self.assertEqual(result["side"], "CE")
+        self.assertEqual(result["plan"]["entry"], 105.0)
+        self.assertEqual(result["plan"]["t1"], 110.0)
+
+    def test_reverse_setup_veto_by_chop_filter(self):
+        """Flipped side still re-evaluated by chop filter. If Nifty is now
+        chop at the reverse-trigger moment, the flip is demoted to WATCH."""
+        watch = self._sample_watch(side="CE")
+        # Chop regime: both conditions inside the chop band
+        nifty = {"bias": "FLAT", "chg_pct": 0.10,
+                 "chg_from_open_pct": 0.10, "range_pct_60min": 0.30}
+        now = dt.datetime(2026, 11, 9, 10, 52, tzinfo=IST)
+        result = strategy._evaluate_reverse_setup(
+            watch, current_ltp=94.5, now=now,
+            nifty_bias=nifty,
+            vix={"ltp": 15.0, "ema20": 15.0},
+            breadth={"pct_above_prev_close": 35.0},
+        )
+        self.assertEqual(result["verdict"], "WATCH_PE")
+        self.assertIn("Nifty regime (chop filter)", result["fails"])
+
+    def test_reverse_setup_veto_by_nifty_trend_against_flipped_side(self):
+        """CE watch stops out, but Nifty is roaring up (chg_pct +0.6%). The
+        flipped PE would be fighting the index -> Nifty-trend gate blocks it."""
+        watch = self._sample_watch(side="CE")
+        nifty = {"bias": "UP", "chg_pct": 0.6,
+                 "chg_from_open_pct": 0.6, "range_pct_60min": 1.0}
+        now = dt.datetime(2026, 11, 9, 10, 52, tzinfo=IST)
+        result = strategy._evaluate_reverse_setup(
+            watch, current_ltp=94.5, now=now,
+            nifty_bias=nifty,
+            vix={"ltp": 15.0, "ema20": 15.0},
+            breadth={"pct_above_prev_close": 65.0},
+        )
+        self.assertEqual(result["verdict"], "WATCH_PE")
+        self.assertIn("Nifty intraday trend", result["fails"])
+
+    def test_defaults(self):
+        self.assertEqual(strategy.REVERSE_WATCH_MAX_MINUTES, 60)
+        self.assertEqual(strategy.REVERSE_WATCH_CUTOFF, dt.time(14, 0))
+        self.assertEqual(strategy.REVERSE_WATCH_T1_R, 1.0)
+        self.assertEqual(strategy.REVERSE_WATCH_T2_R, 2.0)
+
+
 if __name__ == "__main__":
     unittest.main()

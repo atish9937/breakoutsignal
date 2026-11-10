@@ -82,7 +82,10 @@ def run_cycle(dh, master, prep, universe, exclude, trend_expiry, day, now, fired
              fired.setdefault(liquidity_sweep.STRATEGY, set())),
             {},
         ))
-    if _at_or_before(now, opening_range_breakout.ENTRY_END):
+    # Commit R: ORB scan runs through REVERSE_WATCH_CUTOFF (14:00) so a late
+    # stop-break on an earlier ORB fire can still trigger the symmetric flip.
+    # Primary ORB fires are still gated to ENTRY_END (11:00) inside scan().
+    if _at_or_before(now, opening_range_breakout.REVERSE_WATCH_CUTOFF):
         trimmed = {s: sid for s, sid in universe.items() if s not in exclude}
         scanners.append((
             opening_range_breakout.STRATEGY,

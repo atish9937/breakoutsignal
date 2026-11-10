@@ -71,11 +71,14 @@ class StrategyRunnerTests(unittest.TestCase):
         monitor_positions.assert_called_once_with(client, day, now)
 
     def test_extended_breakout_window_does_not_extend_trend_pullback(self):
+        """At 14:01 IST, only breakout (with extended-entry flag) runs.
+        trend_pullback is NOT extended by the flag. ORB would normally run
+        until 14:00 (REVERSE_WATCH_CUTOFF) - 14:01 is past that too."""
         client = Mock()
         prep = {"expiry": "2026-10-29"}
         universe = {"AAA": 1}
         day = dt.date(2026, 10, 19)
-        now = dt.datetime(2026, 10, 19, 14, 0, tzinfo=breakout.IST)
+        now = dt.datetime(2026, 10, 19, 14, 1, tzinfo=breakout.IST)
         fired = {"breakout": set(), "trend_pullback": set()}
 
         with patch.object(breakout, "scan", return_value={}) as scan_breakout:

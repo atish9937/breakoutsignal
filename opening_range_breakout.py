@@ -112,6 +112,22 @@ MIN_T1_DISTANCE_PCT = 0.40
 
 MAX_FIRES_PER_DAY = 2               # at most 1 CE + 1 PE per day
 
+# Commit R: ORB reverse-watch. When an ORB fire stops out shortly after
+# firing, the price often continues cleanly in the opposite direction - Nov 4
+# HDFCAMC CE, Nov 5 TITAN + BANKBARODA CE, Nov 9 BAJFINANCE + ASIANPAINT PE
+# were all stop_before_t1 outcomes whose symmetric-R flip would have hit T1.
+# Mechanism: on each BUY fire, write a sidecar watch row. On subsequent 5-min
+# scan cycles, if LTP crosses the original stop within REVERSE_WATCH_MAX_MINUTES,
+# construct a flipped-side result with symmetric R (new entry = broken stop,
+# new stop = original entry, T1/T2 mirrored) and run it through the regime
+# gates (chop filter, Nifty trend, MACD, breadth, VIX). If gates pass, fire
+# the flip. Guardrails: ORB-only, max 1 reverse per symbol per day, never
+# fires after REVERSE_WATCH_CUTOFF.
+REVERSE_WATCH_MAX_MINUTES = 60      # drop the watch after this many minutes
+REVERSE_WATCH_CUTOFF = dt.time(14, 0)  # hard cutoff; past this, never fire a reverse
+REVERSE_WATCH_T1_R = 1.0            # symmetric with the original ORB targets
+REVERSE_WATCH_T2_R = 2.0
+
 OUT = core.OUT
 
 
@@ -589,13 +605,224 @@ def notify_signal(result: dict) -> None:
     )
 
 
+def _watches_path(day: dt.date):
+    return OUT / f"{STRATEGY}_watches_{day}.jsonl"
+
+
+def _load_watches(day: dt.date) -> list[dict]:
+    path = _watches_path(day)
+    if not path.exists():
+        return []
+    rows = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    except OSError:
+        return []
+    return rows
+
+
+def _save_watches(day: dt.date, watches: list[dict]) -> None:
+    path = _watches_path(day)
+    path.parent.mkdir(exist_ok=True)
+    tmp = path.with_suffix(".jsonl.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as stream:
+            for w in watches:
+                stream.write(json.dumps(w) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(f"ORB watch file write failed: {exc}", file=sys.stderr)
+
+
+def _write_reverse_watch(result: dict, now: dt.datetime, day: dt.date) -> None:
+    """Called inside _fire_if_ready immediately after a BUY is persisted.
+    Writes a sidecar row that scan() will inspect on subsequent cycles."""
+    plan = result.get("plan") or {}
+    opt = result.get("option") or {}
+    try:
+        expires_at = (now + dt.timedelta(minutes=REVERSE_WATCH_MAX_MINUTES)).isoformat()
+    except Exception:  # noqa: BLE001
+        return
+    watch = {
+        "symbol": result["symbol"],
+        "original_side": result["side"],
+        "original_entry": plan.get("entry"),
+        "original_stop": plan.get("stop"),
+        "original_t1": plan.get("t1"),
+        "original_t2": plan.get("t2"),
+        "fire_time": now.isoformat(),
+        "atr_5m": result.get("atr_5m"),
+        "security_id": opt.get("security_id"),
+        "underlying_security_id": result.get("underlying_security_id"),
+        "underlying_segment": result.get("underlying_segment"),
+        "expires_at": expires_at,
+        "reversed": False,
+    }
+    watches = _load_watches(day)
+    # Drop any prior watch for the same symbol on the same day (shouldn't happen
+    # because of cross-strategy dedupe, but defensive)
+    watches = [w for w in watches if w.get("symbol") != result["symbol"]]
+    watches.append(watch)
+    _save_watches(day, watches)
+
+
+def _apply_reverse_regime_gates(result: dict, side: str, nifty_bias: dict,
+                                 vix: dict | None, breadth: dict | None) -> None:
+    """Minimal gate subset for a reverse-watch flip. Mirrors the regime gates
+    inside evaluate_setup but drops the OR-breakout / prior-day / ADX / entry-
+    window checks (those applied to the original fire; the reverse is a
+    reactive flip, not a fresh breakout)."""
+    checks = result["mechanical_checks"]
+    # Nifty intraday trend (symmetric veto)
+    nifty_chg = (nifty_bias or {}).get("chg_pct")
+    if nifty_chg is None:
+        nifty_trend_ok, nifty_trend_text = True, "Nifty chg_pct unavailable"
+    elif side == "CE" and nifty_chg < -NIFTY_TREND_VETO_PCT:
+        nifty_trend_ok = False
+        nifty_trend_text = f"Nifty {nifty_chg:+.2f}% - too bearish for CE"
+    elif side == "PE" and nifty_chg > NIFTY_TREND_VETO_PCT:
+        nifty_trend_ok = False
+        nifty_trend_text = f"Nifty {nifty_chg:+.2f}% - too bullish for PE"
+    else:
+        nifty_trend_ok = True
+        nifty_trend_text = f"Nifty {nifty_chg:+.2f}% aligned with {side}"
+    _record(checks, "Nifty intraday trend", nifty_trend_text,
+            f"within +/-{NIFTY_TREND_VETO_PCT:.2f}% or aligned", nifty_trend_ok)
+
+    # Chop filter (Commit Q)
+    nifty_chg_from_open = (nifty_bias or {}).get("chg_from_open_pct")
+    nifty_range_60m = (nifty_bias or {}).get("range_pct_60min")
+    if nifty_chg_from_open is None or nifty_range_60m is None:
+        chop_ok = True
+        chop_text = "Nifty chg_from_open or 60-min range unavailable"
+    else:
+        is_chop = (abs(nifty_chg_from_open) < NIFTY_CHOP_ABS_CHG_MAX_PCT
+                   and nifty_range_60m < NIFTY_CHOP_RANGE_MAX_PCT)
+        chop_ok = not is_chop
+        chop_text = (f"Nifty chg_from_open {nifty_chg_from_open:+.2f}%, "
+                     f"60-min range {nifty_range_60m:.2f}%")
+    _record(checks, "Nifty regime (chop filter)", chop_text,
+            f"NOT (|chg_from_open| < {NIFTY_CHOP_ABS_CHG_MAX_PCT:.2f}% "
+            f"AND 60-min range < {NIFTY_CHOP_RANGE_MAX_PCT:.2f}%)",
+            chop_ok)
+
+    # Breadth (aligned with FLIPPED side)
+    breadth_pct = (breadth or {}).get("pct_above_prev_close")
+    if breadth_pct is None:
+        breadth_ok, breadth_text = True, "breadth n/a"
+    elif side == "CE":
+        breadth_ok = breadth_pct >= BREADTH_MIN_PCT_FOR_CE
+        breadth_text = f"{breadth_pct:.1f}% above prev-close; need >= {BREADTH_MIN_PCT_FOR_CE:.0f}%"
+    else:
+        breadth_ok = breadth_pct <= BREADTH_MAX_PCT_FOR_PE
+        breadth_text = f"{breadth_pct:.1f}% above prev-close; need <= {BREADTH_MAX_PCT_FOR_PE:.0f}%"
+    _record(checks, "Market breadth", breadth_text,
+            "breadth aligned with trade direction", breadth_ok)
+
+    # VIX regime
+    vix_ltp = (vix or {}).get("ltp")
+    vix_ema = (vix or {}).get("ema20")
+    if vix_ltp is None or vix_ema is None or vix_ema <= 0:
+        vix_ok, vix_text = True, "VIX regime n/a"
+    else:
+        multiplier = vix_ltp / vix_ema
+        vix_ok = multiplier <= VIX_SPIKE_MULTIPLIER
+        vix_text = f"VIX {vix_ltp:.2f}/EMA20 {vix_ema:.2f} = {multiplier:.2f}x"
+    _record(checks, "India VIX regime", vix_text,
+            f"VIX / 20d-EMA <= {VIX_SPIKE_MULTIPLIER:.2f}", vix_ok)
+
+
+def _evaluate_reverse_setup(watch: dict, current_ltp: float, now: dt.datetime,
+                             nifty_bias: dict, vix: dict | None,
+                             breadth: dict | None) -> dict:
+    """Build a flipped-side result when the original ORB watch's stop was
+    broken. Returns a result dict ready for attach_option_check + _fire_if_ready."""
+    original_side = watch["original_side"]
+    flipped_side = "PE" if original_side == "CE" else "CE"
+    sign = 1 if flipped_side == "CE" else -1
+
+    # Anchor new entry at the broken stop level. Risk is symmetric with original.
+    entry = float(watch["original_stop"])
+    original_entry = float(watch["original_entry"])
+    risk = abs(original_entry - entry)
+    stop = original_entry  # the original fire price becomes the new stop
+    t1 = entry + sign * REVERSE_WATCH_T1_R * risk
+    t2 = entry + sign * REVERSE_WATCH_T2_R * risk
+
+    result = {
+        "strategy": STRATEGY,
+        "symbol": watch["symbol"],
+        "side": flipped_side,
+        "time": now.strftime("%H:%M:%S"),
+        "ltp": core.r2(current_ltp),
+        "atr_5m": core.r2(float(watch.get("atr_5m") or 0)),
+        "mechanical_checks": [],
+        "fails": [],
+        "reverse_of": original_side,
+        "reverse_watch_fire_time": watch["fire_time"],
+        "plan": {
+            "entry": core.r2(entry),
+            "stop": core.r2(stop),
+            "risk_per_share": core.r2(risk),
+            "t1": core.r2(t1),
+            "t2": core.r2(t2),
+        },
+    }
+    if watch.get("underlying_security_id"):
+        result["underlying_security_id"] = watch["underlying_security_id"]
+    if watch.get("underlying_segment"):
+        result["underlying_segment"] = watch["underlying_segment"]
+
+    _record(result["mechanical_checks"], "Reverse trigger",
+            f"LTP {current_ltp:.2f} crossed original stop {entry:.2f} "
+            f"(original {original_side} side)",
+            "LTP crosses original stop within reverse-watch window",
+            True)
+
+    _apply_reverse_regime_gates(result, flipped_side, nifty_bias, vix, breadth)
+
+    result["fails"] = [c["gate"] for c in result["mechanical_checks"] if not c["passed"]]
+    result["verdict"] = (f"SETUP_{flipped_side}" if not result["fails"]
+                        else f"WATCH_{flipped_side}")
+    return result
+
+
+def notify_reverse_signal(result: dict) -> None:
+    opt, plan = result["option"], result["plan"]
+    _notify(
+        f"[ORB REVERSE] {result['verdict']} {result['symbol']} "
+        f"(flipped from {result['reverse_of']} - stop broke)\n"
+        f"Underlying {result['ltp']} | reverse entry {plan['entry']}\n"
+        f"{opt['contract']} [{opt['selection']}] ~Rs{opt['premium']} | lot {opt['lot_size']}\n"
+        f"Stop {plan['stop']} | T1 {plan['t1']} | T2 {plan['t2']}\n"
+        f"Approx. loss/lot Rs{plan['estimated_loss_per_lot']}\n"
+        f"Checks passed: {sum(c['passed'] for c in result['mechanical_checks'])}/"
+        f"{len(result['mechanical_checks'])}\n"
+        "Recommendations only; no order was placed."
+    )
+
+
 def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
          now: dt.datetime, fired: set[str]) -> dict:
-    """One scan cycle. Only runs during the entry window (09:45-11:00)."""
+    """One scan cycle. Primary ORB entry runs ENTRY_START-ENTRY_END (09:45-11:00).
+    Reverse-watches (Commit R) keep running up to REVERSE_WATCH_CUTOFF (14:00)
+    so a stop-break after the entry window can still fire the symmetric flip."""
     current = now.astimezone(core.IST)
-    if not (ENTRY_START <= current.time() <= ENTRY_END):
+    in_entry_window = ENTRY_START <= current.time() <= ENTRY_END
+    in_reverse_window = (ENTRY_START <= current.time() <= REVERSE_WATCH_CUTOFF
+                         and _load_watches(day))
+    if not (in_entry_window or in_reverse_window):
         return {"strategy": STRATEGY, "scan_time": current.strftime("%Y-%m-%d %H:%M:%S"),
-                "candidates_checked": 0, "results": [], "note": "outside entry window"}
+                "candidates_checked": 0, "results": [],
+                "note": "outside entry + reverse-watch windows"}
 
     # Per-day fire limit - count by reading the signal file directly so a
     # server restart mid-session doesn't reset the counter. (Previous
@@ -654,13 +881,103 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
             return
         fired.add(key)
         fired_today += 1
+        # Commit R: also record a reverse-watch row so a quick stop-break can
+        # fire the symmetric flip. Only for primary ORB fires (not reverse
+        # fires themselves - those don't get a second reverse watch).
+        if not result.get("reverse_of"):
+            try:
+                _write_reverse_watch(result, current, day)
+            except Exception as exc:   # noqa: BLE001
+                print(f"ORB reverse-watch write failed: {exc}", file=sys.stderr)
         try:
-            notify_signal(result)
+            if result.get("reverse_of"):
+                notify_reverse_signal(result)
+            else:
+                notify_signal(result)
         except Exception as exc:   # noqa: BLE001
             print(f"ORB Telegram notify failed: {exc}", file=sys.stderr)
 
+    # ---- Reverse-watch processing (Commit R) --------------------------------
+    # Check active watches BEFORE evaluating fresh ORB candidates. A quick
+    # stop-break (within REVERSE_WATCH_MAX_MINUTES) fires the symmetric flip
+    # if the regime gates still agree with the opposite side.
+    watches = _load_watches(day)
+    watches_dirty = False
+    for watch in watches:
+        if watch.get("reversed"):
+            continue
+        try:
+            expires_at = dt.datetime.fromisoformat(watch["expires_at"])
+        except (KeyError, ValueError):
+            continue
+        if current > expires_at or current.time() > REVERSE_WATCH_CUTOFF:
+            continue
+        # Resolve current LTP for the watched symbol
+        sym = watch["symbol"]
+        ltp = None
+        # Equity path
+        if sym in universe:
+            eq_quotes = (quotes or {}).get("NSE_EQ") or {}
+            q = eq_quotes.get(str(universe[sym])) or {}
+            ltp = q.get("last_price")
+        # Index path (symbols from liquidity_sweep.INDICES)
+        if ltp is None:
+            idx_quotes = (quotes or {}).get("IDX_I") or {}
+            sid_hint = watch.get("underlying_security_id")
+            if sid_hint:
+                q = idx_quotes.get(str(sid_hint)) or {}
+                ltp = q.get("last_price")
+        if ltp is None:
+            continue
+        # Has LTP crossed the original stop in the direction that would break it?
+        original_side = watch["original_side"]
+        original_stop = float(watch["original_stop"])
+        stop_broken = ((original_side == "CE" and ltp <= original_stop)
+                       or (original_side == "PE" and ltp >= original_stop))
+        if not stop_broken:
+            continue
+        # Evaluate the flipped setup against regime gates
+        rev_result = _evaluate_reverse_setup(
+            watch, float(ltp), current, nifty, vix, breadth,
+        )
+        if rev_result.get("verdict") == f"SETUP_{rev_result['side']}":
+            if not stock_expiry:
+                _record(rev_result["mechanical_checks"], "Option expiry",
+                        "unavailable", "valid expiry available", False)
+                rev_result["fails"].append("option expiry unavailable")
+                rev_result["verdict"] = f"WATCH_{rev_result['side']}"
+            else:
+                try:
+                    sid_for_chain = (universe.get(sym)
+                                     or watch.get("underlying_security_id"))
+                    seg_for_chain = watch.get("underlying_segment")
+                    if seg_for_chain:
+                        chain = dh.option_chain(sid_for_chain, stock_expiry,
+                                                seg=seg_for_chain)
+                    else:
+                        chain = dh.option_chain(sid_for_chain, stock_expiry)
+                    rev_result = attach_option_check(
+                        rev_result, master, stock_expiry, chain, day=day
+                    )
+                except core.DhanAuthError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    rev_result["fails"].append(f"option chain error: {exc}")
+                    rev_result["verdict"] = f"WATCH_{rev_result['side']}"
+        _fire_if_ready(rev_result)
+        if rev_result.get("verdict", "").startswith("BUY_"):
+            watch["reversed"] = True
+            watch["reverse_fire_time"] = current.isoformat()
+            watches_dirty = True
+        results.append(rev_result)
+    if watches_dirty:
+        _save_watches(day, watches)
+
     # ---- Equity universe -----------------------------------------------------
-    for symbol, sid in universe.items():
+    # Skip fresh ORB evaluation if we're past the entry window (11:00). The
+    # reverse-watch block above still runs up to 14:00, but primary fires
+    # must stay inside ENTRY_START-ENTRY_END.
+    for symbol, sid in (universe.items() if in_entry_window else ()):
         try:
             candles = dh.intraday(sid, frm, now)
             candles = candles[candles.index <= pd.Timestamp(now) - pd.Timedelta(minutes=5)]
@@ -696,7 +1013,7 @@ def scan(dh, master, prep: dict, universe: dict[str, int], day: dt.date,
     # liquidity_sweep's INDICES config and helpers so index pool/expiry
     # resolution stays consistent across both strategies.
     import liquidity_sweep as _ls
-    for index_name, cfg in _ls.INDICES.items():
+    for index_name, cfg in (_ls.INDICES.items() if in_entry_window else ()):
         sid = cfg["sid"]
         seg = cfg["underlying_seg"]
         try:
