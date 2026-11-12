@@ -40,7 +40,7 @@ class TrendPullbackTests(unittest.TestCase):
             level = {9: 107.5, 21: 105.0, 50: 100.0}[span]
             return pd.Series(level, index=values.index)
 
-        now = dt.datetime(2026, 10, 19, 10, 25, tzinfo=core.IST)
+        now = dt.datetime(2026, 10, 19, 11, 30, tzinfo=core.IST)
         with patch.object(core, "ema", side_effect=fake_ema), \
                 patch.object(core, "atr", return_value=2.0), \
                 patch.object(core, "vwap", return_value=103.0), \
@@ -87,7 +87,7 @@ class TrendPullbackTests(unittest.TestCase):
             level = {9: 92.5, 21: 95.0, 50: 100.0}[span]
             return pd.Series(level, index=values.index)
 
-        now = dt.datetime(2026, 10, 19, 10, 25, tzinfo=core.IST)
+        now = dt.datetime(2026, 10, 19, 11, 30, tzinfo=core.IST)
         with patch.object(core, "ema", side_effect=fake_ema), \
                 patch.object(core, "atr", return_value=2.0), \
                 patch.object(core, "vwap", return_value=97.0), \
@@ -118,8 +118,50 @@ class TrendPullbackTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "WATCH_CE")
         self.assertIn("Entry time", result["fails"])
 
+    def test_commit_u_mid_morning_blackout_blocks_entry(self):
+        """Commit U: 30-day audit showed 10:15-10:55 produced 1 win vs 11 losses
+        (9% win rate). A valid setup inside that window must be blocked."""
+        blackout_now = dt.datetime(2026, 10, 19, 10, 30, tzinfo=core.IST)
+        candles = self.make_candles()
+
+        def fake_ema(values, span):
+            return pd.Series({9: 107.5, 21: 105.0, 50: 100.0}[span], index=values.index)
+
+        with patch.object(core, "ema", side_effect=fake_ema), \
+                patch.object(core, "atr", return_value=2.0), \
+                patch.object(core, "vwap", return_value=103.0), \
+                patch.object(core, "rsi", return_value=60.0), \
+                patch.object(core, "macd_hist", return_value=0.2):
+            result = strategy.evaluate_setup("TEST", candles, blackout_now, {"bias": "UP"})
+
+        self.assertIn("Entry time", result["fails"])
+        self.assertNotEqual(result["verdict"], "SETUP_CE")
+
+    def test_commit_u_blackout_boundary_1114_is_allowed(self):
+        """Blackout ends at 10:59 inclusive; 11:00 onward is allowed again."""
+        after_blackout = dt.datetime(2026, 10, 19, 11, 14, tzinfo=core.IST)
+        candles = self.make_candles()
+
+        def fake_ema(values, span):
+            return pd.Series({9: 107.5, 21: 105.0, 50: 100.0}[span], index=values.index)
+
+        with patch.object(core, "ema", side_effect=fake_ema), \
+                patch.object(core, "atr", return_value=2.0), \
+                patch.object(core, "vwap", return_value=103.0), \
+                patch.object(core, "rsi", return_value=60.0), \
+                patch.object(core, "macd_hist", return_value=0.2):
+            result = strategy.evaluate_setup("TEST", candles, after_blackout, {"bias": "UP"})
+
+        # Entry time gate must pass at 11:14
+        entry_check = next(c for c in result["mechanical_checks"] if c["gate"] == "Entry time")
+        self.assertTrue(entry_check["passed"])
+
+    def test_commit_u_blackout_constants(self):
+        self.assertEqual(strategy.ENTRY_BLACKOUT_START, dt.time(10, 15))
+        self.assertEqual(strategy.ENTRY_BLACKOUT_END, dt.time(10, 59))
+
     def test_empty_candle_response_returns_a_clear_skip(self):
-        now = dt.datetime(2026, 10, 19, 10, 25, tzinfo=core.IST)
+        now = dt.datetime(2026, 10, 19, 11, 30, tzinfo=core.IST)
         result = strategy.evaluate_setup(
             "TEST",
             pd.DataFrame(columns=["open", "high", "low", "close", "volume"]),
@@ -265,7 +307,7 @@ class TrendPullbackTests(unittest.TestCase):
             level = {9: 107.5, 21: 105.0, 50: 100.0}[span]
             return pd.Series(level, index=values.index)
 
-        now = dt.datetime(2026, 10, 19, 10, 25, tzinfo=core.IST)
+        now = dt.datetime(2026, 10, 19, 11, 30, tzinfo=core.IST)
         with patch.object(core, "ema", side_effect=fake_ema), \
                 patch.object(core, "atr", return_value=2.0), \
                 patch.object(core, "vwap", return_value=103.0), \

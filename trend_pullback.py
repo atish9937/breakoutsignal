@@ -26,6 +26,16 @@ RUN_START = dt.time(9, 20)
 RUN_END = dt.time(12, 35)
 ENTRY_START = dt.time(9, 30)
 ENTRY_END = dt.time(12, 30)
+# Commit U: mid-morning blackout. 30-day ledger audit on 2026-11-11 showed
+# the 10:00-10:55 hour produced 3 wins vs 11 losses (21% win rate) while the
+# rest of the entry window ran 11 wins vs 8 losses (58% win rate). The
+# toxic cluster is especially tight at 10:20-10:55 where only 1 of 12 fires
+# won. Pattern consistent with mid-morning chop: first-hour momentum has
+# faded but lunchtime-trend direction has not yet set in; pullback setups
+# fire on noise rather than tradeable reversion. Block fires during the
+# window below so trend_pullback only runs 09:30-10:14 and 11:00-12:30.
+ENTRY_BLACKOUT_START = dt.time(10, 15)
+ENTRY_BLACKOUT_END = dt.time(10, 59)
 PULLBACK_BARS = 4
 PULLBACK_ATR_TOLERANCE = 0.25
 MAX_EXTENSION_ATR = 0.5
@@ -238,10 +248,16 @@ def evaluate_setup(symbol, candles, now, nifty_bias, daily_ctx=None,
     record_check(checks, "Entry extension", f"{extension:.2f}; ATR {atr_value:.2f}",
                  f"not more than {MAX_EXTENSION_ATR:.2f} ATR beyond EMA9", extension_ok)
 
-    entry_allowed = ENTRY_START <= now.time() <= ENTRY_END
-    record_check(checks, "Entry time", now.strftime("%H:%M"),
-                 f"{ENTRY_START.strftime('%H:%M')}–{ENTRY_END.strftime('%H:%M')} IST",
-                 entry_allowed)
+    in_window = ENTRY_START <= now.time() <= ENTRY_END
+    in_blackout = ENTRY_BLACKOUT_START <= now.time() <= ENTRY_BLACKOUT_END
+    entry_allowed = in_window and not in_blackout
+    record_check(
+        checks, "Entry time", now.strftime("%H:%M"),
+        f"{ENTRY_START.strftime('%H:%M')}-{ENTRY_BLACKOUT_START.strftime('%H:%M')} "
+        f"or {(dt.datetime.combine(dt.date.today(), ENTRY_BLACKOUT_END) + dt.timedelta(minutes=1)).time().strftime('%H:%M')}-{ENTRY_END.strftime('%H:%M')} IST "
+        f"(mid-morning blackout 10:15-10:59)",
+        entry_allowed,
+    )
 
     # ADX trend strength on the 5-minute series - trending-only strategy.
     adx_value = core.adx(today)
