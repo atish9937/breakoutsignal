@@ -1243,13 +1243,39 @@ def finalize_day(
         and (_multiframe_premium_estimate(s) or 0) > 0
     )
 
+    # Commit V: swing_option post-trigger P&L tracking. Count *resolved*
+    # outcomes (target_hit / stop_hit / forced_exit) from any
+    # swing_option_candidates_*.json file; "wins" are target_hit OR
+    # forced_exit with pnl_r > 0. "Trigger confirmed" alone is NOT a win.
+    import pathlib as _pl
+    swing_resolved = swing_wins = 0
+    try:
+        for p in _pl.Path(report_dir).glob("swing_option_candidates_*.json"):
+            try:
+                rep = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            for cand in rep.get("candidates", []):
+                outcome = cand.get("next_session_outcome")
+                if not outcome:
+                    continue
+                swing_resolved += 1
+                pnl_r = outcome.get("pnl_r")
+                if outcome.get("status") == "target_hit":
+                    swing_wins += 1
+                elif outcome.get("status") == "forced_exit" and isinstance(pnl_r, (int, float)) and pnl_r > 0:
+                    swing_wins += 1
+    except Exception:  # noqa: BLE001
+        pass
+
     caption = (
         f"Paper performance {session_date.isoformat()} IST | "
         f"Breakout {_wins_resolved('breakout')} T1 wins; "
         f"Trend {_wins_resolved('trend_pullback')}; "
         f"Sweep {_wins_resolved('liquidity_sweep')}; "
         f"ORB {_wins_resolved('opening_range_breakout')}; "
-        f"15m {multiframe_wins}/{multiframe_resolved}. "
+        f"15m {multiframe_wins}/{multiframe_resolved}; "
+        f"Swing {swing_wins}/{swing_resolved}. "
         "Underlying-based tracking; no orders placed."
     )
     try:

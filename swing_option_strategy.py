@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import math
 import os
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -507,3 +508,231 @@ def monitor_next_session(dh, master: pd.DataFrame, day: dt.date,
         if changed:
             path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     return fired
+
+
+# ---------------------------------------------------------------------------
+# Commit V: post-trigger P&L tracking.
+#
+# monitor_next_session() records that a saved candidate's entry_trigger was
+# crossed. But until this commit we never tracked what happened AFTER the
+# trigger - the "win%" metric in the 30-day audit was really "trigger-hit
+# rate," not actual P&L. This block resolves the real outcome by replaying
+# daily bars from confirmation through hold end (max 3 sessions OR Friday
+# close, whichever is earlier) and classifying each candidate as target_hit,
+# stop_hit, or forced_exit (with realised R).
+#
+# Prefers daily bars for speed. Falls back to intraday 5-min only when both
+# target AND stop high/low are inside the same daily range (ambiguous).
+# ---------------------------------------------------------------------------
+
+
+def _next_trading_day(d: dt.date) -> dt.date:
+    nd = d + dt.timedelta(days=1)
+    while nd.weekday() >= 5:   # 5=Sat, 6=Sun
+        nd += dt.timedelta(days=1)
+    return nd
+
+
+def _hold_end_date(confirmed_date: dt.date) -> dt.date:
+    """Return the inclusive last trading day the position may be held."""
+    # 3 sessions = confirmed_date, +1 trading day, +2 trading days
+    end_by_session = confirmed_date
+    for _ in range(MAX_HOLD_SESSIONS - 1):
+        end_by_session = _next_trading_day(end_by_session)
+    # Friday of confirmed_date's week (weekday: Mon=0, Fri=4)
+    days_to_friday = (4 - confirmed_date.weekday()) % 7
+    friday = confirmed_date + dt.timedelta(days=days_to_friday)
+    # If confirmed on Fri, friday == confirmed_date; still the cutoff.
+    return min(end_by_session, friday)
+
+
+def _resolve_from_daily(candles: pd.DataFrame, side: str, entry: float,
+                        stop: float, target: float, confirmed_date: dt.date,
+                        hold_end: dt.date) -> dict | None:
+    """Walk daily bars from confirmed_date through hold_end. Return outcome
+    dict with keys {status, outcome_date, outcome_price, pnl_r, ambiguous}
+    or None if neither target nor stop hit AND hold window not yet closed."""
+    if candles.empty:
+        return None
+    sign = 1 if side == "CE" else -1
+    risk = abs(entry - stop)
+    # Pick only bars in [confirmed_date, hold_end]; sorted by index
+    frame = candles.sort_index()
+    # Normalize index to date for filtering (works for both tz-aware and naive)
+    def _as_date(ts):
+        try:
+            return ts.date()
+        except AttributeError:
+            return pd.Timestamp(ts).date()
+    window_bars = []
+    for ts, row in frame.iterrows():
+        d = _as_date(ts)
+        if d < confirmed_date:
+            continue
+        if d > hold_end:
+            break
+        window_bars.append((d, row))
+    if not window_bars:
+        return None
+    for d, row in window_bars:
+        hi = float(row["high"])
+        lo = float(row["low"])
+        close = float(row["close"])
+        if side == "CE":
+            target_hit = hi >= target
+            stop_hit = lo <= stop
+        else:
+            target_hit = lo <= target
+            stop_hit = hi >= stop
+        if target_hit and stop_hit:
+            # Ambiguous same-day; caller may fetch intraday to break tie.
+            return {
+                "status": "ambiguous_same_day_both_hit",
+                "outcome_date": d.isoformat(),
+                "outcome_price": close,
+                "target_price": target,
+                "stop_price": stop,
+                "pnl_r": None,
+                "ambiguous": True,
+            }
+        if target_hit:
+            return {
+                "status": "target_hit",
+                "outcome_date": d.isoformat(),
+                "outcome_price": target,
+                "pnl_r": 2.0,
+                "ambiguous": False,
+            }
+        if stop_hit:
+            return {
+                "status": "stop_hit",
+                "outcome_date": d.isoformat(),
+                "outcome_price": stop,
+                "pnl_r": -1.0,
+                "ambiguous": False,
+            }
+    # Walked all bars inside the window; neither hit.
+    last_date, last_row = window_bars[-1]
+    if last_date >= hold_end:
+        # Hold window closed; forced exit at last close.
+        close = float(last_row["close"])
+        pnl_r = sign * (close - entry) / risk if risk > 0 else 0.0
+        return {
+            "status": "forced_exit",
+            "outcome_date": last_date.isoformat(),
+            "outcome_price": close,
+            "pnl_r": round(pnl_r, 3),
+            "ambiguous": False,
+        }
+    # Still open (no hit yet, window not closed)
+    return None
+
+
+def monitor_confirmed_outcomes(dh, master: pd.DataFrame, day: dt.date,
+                                now: dt.datetime, output_dir: Path) -> list[dict]:
+    """Resolve P&L outcomes for every trigger_confirmed candidate whose hold
+    window has expired or whose target/stop level was hit.
+
+    Idempotent - once `next_session_outcome` is set on a candidate, this
+    function skips it on subsequent calls.
+    """
+    resolved: list[dict] = []
+    for path in sorted(output_dir.glob("swing_option_candidates_*.json")):
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Could not read swing candidate file {path.name}: {exc}",
+                  file=sys.stderr)
+            continue
+        changed = False
+        for cand in report.get("candidates", []):
+            if cand.get("next_session_status") != "trigger_confirmed":
+                continue
+            if cand.get("next_session_outcome"):
+                continue
+            confirmed_at_raw = cand.get("confirmed_at")
+            if not confirmed_at_raw:
+                continue
+            try:
+                confirmed_date = dt.datetime.fromisoformat(confirmed_at_raw).date()
+            except ValueError:
+                continue
+            hold_end = _hold_end_date(confirmed_date)
+            # Don't attempt resolution before any trading has happened after
+            # confirmation. On confirmation day itself, we only act if day > confirmed_date.
+            if day < confirmed_date:
+                continue
+            side = cand["side"]
+            u = cand.get("underlying") or {}
+            try:
+                entry = float(u["entry_trigger"])
+                stop = float(u["stop"])
+                target = float(u["target_2r"])
+                sid = int(cand["underlying_security_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            try:
+                daily = dh.daily_range(sid, confirmed_date, min(day, hold_end))
+            except core.DhanAuthError:
+                raise
+            except Exception as exc:   # noqa: BLE001
+                cand["next_session_outcome_error"] = f"{type(exc).__name__}: {exc}"
+                changed = True
+                continue
+            outcome = _resolve_from_daily(daily, side, entry, stop, target,
+                                          confirmed_date, hold_end)
+            if outcome is None:
+                continue
+            # Ambiguous same-day: try intraday 5-min to break the tie.
+            if outcome.get("ambiguous"):
+                try:
+                    amb_date = dt.date.fromisoformat(outcome["outcome_date"])
+                    intraday = dh.intraday(
+                        sid,
+                        dt.datetime.combine(amb_date, dt.time(9, 15), core.IST),
+                        dt.datetime.combine(amb_date, dt.time(15, 30), core.IST),
+                        interval=5,
+                    )
+                    for _, bar in intraday.sort_index().iterrows():
+                        hi = float(bar["high"]); lo = float(bar["low"])
+                        if side == "CE":
+                            tgt_hit = hi >= target; stp_hit = lo <= stop
+                        else:
+                            tgt_hit = lo <= target; stp_hit = hi >= stop
+                        if tgt_hit and not stp_hit:
+                            outcome = {"status": "target_hit", "outcome_date": amb_date.isoformat(),
+                                       "outcome_price": target, "pnl_r": 2.0, "ambiguous": False}
+                            break
+                        if stp_hit and not tgt_hit:
+                            outcome = {"status": "stop_hit", "outcome_date": amb_date.isoformat(),
+                                       "outcome_price": stop, "pnl_r": -1.0, "ambiguous": False}
+                            break
+                        if tgt_hit and stp_hit:
+                            # Same 5-min bar; truly ambiguous - leave as-is.
+                            break
+                except core.DhanAuthError:
+                    raise
+                except Exception:   # noqa: BLE001
+                    pass
+            cand["next_session_outcome"] = outcome
+            changed = True
+            resolved.append(cand)
+            token = os.getenv("TELEGRAM_BOT_TOKEN")
+            chat_id = os.getenv("TELEGRAM_CHAT_ID")
+            if token and chat_id:
+                status_label = outcome["status"].replace("_", " ").upper()
+                pnl_r = outcome.get("pnl_r")
+                pnl_tag = f" | realised {pnl_r:+.2f}R" if isinstance(pnl_r, (int, float)) else ""
+                try:
+                    core.send_telegram_message(
+                        token, chat_id,
+                        f"[SWING OUTCOME - PAPER] {cand['symbol']} {cand['side']} "
+                        f"({cand['setup']}): {status_label}{pnl_tag}\n"
+                        f"Confirmed {confirmed_at_raw}; exit {outcome['outcome_date']} "
+                        f"at {outcome['outcome_price']}"
+                    )
+                except Exception as exc:   # noqa: BLE001
+                    print(f"Swing outcome telegram failed: {exc}", file=sys.stderr)
+        if changed:
+            path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return resolved

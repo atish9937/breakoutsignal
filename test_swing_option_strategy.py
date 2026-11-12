@@ -230,5 +230,199 @@ class SwingOptionStrategyTests(unittest.TestCase):
         ])
 
 
+class SwingPostTriggerOutcomeTests(unittest.TestCase):
+    """Commit V: once a swing candidate's trigger is confirmed, monitor_confirmed_outcomes()
+    must classify what actually happened to the underlying during the hold window
+    (max 3 sessions OR Friday close, whichever is first)."""
+
+    def _confirmed_candidate(self, side="CE", confirmed_at="2026-11-02T10:45:00+05:30"):
+        # Monday 2026-11-02; hold-end should be min(Wed 2026-11-04, Fri 2026-11-06) = Wed.
+        return {
+            "symbol": "TEST",
+            "side": side,
+            "setup": "Daily pullback and reversal",
+            "signal_date": "2026-10-30",
+            "score": 5,
+            "nifty_bias": "UP" if side == "CE" else "DOWN",
+            "underlying": {
+                "close": 100.0,
+                "entry_trigger": 101.0,
+                "stop": 98.0,
+                "target_2r": 107.0,
+                "risk": 3.0,
+                "atr14": 2.0,
+            },
+            "holding": {"max_trading_sessions": 3, "weekend_carry": False},
+            "underlying_security_id": 1234,
+            "expiry": "2026-11-27",
+            "next_session_status": "trigger_confirmed",
+            "confirmed_at": confirmed_at,
+            "confirmed_underlying_close": 101.5,
+            "refreshed_option": {"strike": 100, "selection": "ATM",
+                                  "bid": 5.0, "ask": 5.2, "spread_pct": 3.9},
+        }
+
+    def _write_report(self, root: Path, day: str, candidate: dict) -> Path:
+        import json as _json
+        path = root / f"swing_option_candidates_{day}.json"
+        path.write_text(_json.dumps({
+            "as_of": day, "candidates": [candidate],
+        }), encoding="utf-8")
+        return path
+
+    def _fake_dh(self, daily_df=None, intraday_df=None):
+        class _Dh:
+            def daily_range(self, sid, frm, to):
+                return daily_df if daily_df is not None else pd.DataFrame()
+            def intraday(self, sid, frm, to, interval=5, **kw):
+                return intraday_df if intraday_df is not None else pd.DataFrame()
+        return _Dh()
+
+    def test_target_hit_resolves_as_win(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cand = self._confirmed_candidate(side="CE")
+            self._write_report(root, "2026-10-30", cand)
+            # Day after confirmation: high reaches 108 (>= target 107), low 100 (> stop 98)
+            dates = pd.DatetimeIndex([pd.Timestamp("2026-11-03", tz=IST)])
+            daily = pd.DataFrame({"open":[102.0], "high":[108.0], "low":[100.0],
+                                   "close":[107.5], "volume":[100.0]}, index=dates)
+            resolved = strategy.monitor_confirmed_outcomes(
+                self._fake_dh(daily_df=daily),
+                None,
+                dt.date(2026, 11, 3),
+                dt.datetime(2026, 11, 3, 15, 35, tzinfo=IST),
+                root,
+            )
+            self.assertEqual(len(resolved), 1)
+            outcome = resolved[0]["next_session_outcome"]
+            self.assertEqual(outcome["status"], "target_hit")
+            self.assertEqual(outcome["pnl_r"], 2.0)
+
+    def test_stop_hit_resolves_as_loss(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cand = self._confirmed_candidate(side="CE")
+            self._write_report(root, "2026-10-30", cand)
+            # Day after confirmation: low 97 (< stop 98), high 103 (< target 107)
+            dates = pd.DatetimeIndex([pd.Timestamp("2026-11-03", tz=IST)])
+            daily = pd.DataFrame({"open":[101.0], "high":[103.0], "low":[97.0],
+                                   "close":[99.0], "volume":[100.0]}, index=dates)
+            resolved = strategy.monitor_confirmed_outcomes(
+                self._fake_dh(daily_df=daily), None,
+                dt.date(2026, 11, 3),
+                dt.datetime(2026, 11, 3, 15, 35, tzinfo=IST),
+                root,
+            )
+            outcome = resolved[0]["next_session_outcome"]
+            self.assertEqual(outcome["status"], "stop_hit")
+            self.assertEqual(outcome["pnl_r"], -1.0)
+
+    def test_forced_exit_at_hold_end(self):
+        """Neither target nor stop hit; hold window expires -> forced exit at
+        last close with realised R multiple."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cand = self._confirmed_candidate(side="CE")
+            self._write_report(root, "2026-10-30", cand)
+            # Hold window = Mon 11-02 (confirmed), Tue 11-03, Wed 11-04 (hold_end)
+            # All days price drifts between stop and target.
+            dates = pd.DatetimeIndex([
+                pd.Timestamp("2026-11-02", tz=IST),
+                pd.Timestamp("2026-11-03", tz=IST),
+                pd.Timestamp("2026-11-04", tz=IST),
+            ])
+            daily = pd.DataFrame({
+                "open":  [101.0, 102.0, 103.0],
+                "high":  [102.0, 104.0, 104.5],
+                "low":   [100.0, 100.5, 101.0],
+                "close": [102.0, 103.5, 104.0],
+                "volume":[100.0]*3,
+            }, index=dates)
+            resolved = strategy.monitor_confirmed_outcomes(
+                self._fake_dh(daily_df=daily), None,
+                dt.date(2026, 11, 4),
+                dt.datetime(2026, 11, 4, 15, 35, tzinfo=IST),
+                root,
+            )
+            outcome = resolved[0]["next_session_outcome"]
+            self.assertEqual(outcome["status"], "forced_exit")
+            # Close 104 vs entry 101 -> +3 pts on R=3 -> +1.0R
+            self.assertEqual(outcome["pnl_r"], 1.0)
+
+    def test_pe_side_mirrors_direction(self):
+        """PE candidate: hit when price falls below target_2r."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cand = self._confirmed_candidate(side="PE")
+            # PE: entry 101, stop 98 (above for PE must be above entry);
+            # need PE-style levels: stop > entry > target. Rebuild manually:
+            cand["underlying"] = {"close":100, "entry_trigger":99, "stop":102,
+                                   "target_2r":93, "risk":3, "atr14":2}
+            self._write_report(root, "2026-10-30", cand)
+            dates = pd.DatetimeIndex([pd.Timestamp("2026-11-03", tz=IST)])
+            daily = pd.DataFrame({"open":[98.0], "high":[99.0], "low":[92.0],
+                                   "close":[93.5], "volume":[100.0]}, index=dates)
+            resolved = strategy.monitor_confirmed_outcomes(
+                self._fake_dh(daily_df=daily), None,
+                dt.date(2026, 11, 3),
+                dt.datetime(2026, 11, 3, 15, 35, tzinfo=IST),
+                root,
+            )
+            outcome = resolved[0]["next_session_outcome"]
+            self.assertEqual(outcome["status"], "target_hit")
+
+    def test_resolver_is_idempotent(self):
+        """Running twice on a candidate with next_session_outcome already set
+        must not duplicate outcomes or re-call Dhan."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cand = self._confirmed_candidate(side="CE")
+            self._write_report(root, "2026-10-30", cand)
+            dates = pd.DatetimeIndex([pd.Timestamp("2026-11-03", tz=IST)])
+            daily = pd.DataFrame({"open":[102.0], "high":[108.0], "low":[100.0],
+                                   "close":[107.5], "volume":[100.0]}, index=dates)
+            dh = self._fake_dh(daily_df=daily)
+            r1 = strategy.monitor_confirmed_outcomes(
+                dh, None, dt.date(2026, 11, 3),
+                dt.datetime(2026, 11, 3, 15, 35, tzinfo=IST), root,
+            )
+            r2 = strategy.monitor_confirmed_outcomes(
+                dh, None, dt.date(2026, 11, 3),
+                dt.datetime(2026, 11, 3, 15, 35, tzinfo=IST), root,
+            )
+            self.assertEqual(len(r1), 1)
+            self.assertEqual(len(r2), 0)
+
+    def test_non_confirmed_candidates_are_ignored(self):
+        """Resolver must not touch rows with status != 'trigger_confirmed'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cand = self._confirmed_candidate(side="CE")
+            cand["next_session_status"] = "pending"
+            self._write_report(root, "2026-10-30", cand)
+            dates = pd.DatetimeIndex([pd.Timestamp("2026-11-03", tz=IST)])
+            daily = pd.DataFrame({"open":[102.0], "high":[108.0], "low":[100.0],
+                                   "close":[107.5], "volume":[100.0]}, index=dates)
+            resolved = strategy.monitor_confirmed_outcomes(
+                self._fake_dh(daily_df=daily), None,
+                dt.date(2026, 11, 3),
+                dt.datetime(2026, 11, 3, 15, 35, tzinfo=IST),
+                root,
+            )
+            self.assertEqual(resolved, [])
+
+    def test_hold_end_date_respects_friday_cutoff(self):
+        """Confirmed Thursday 2026-11-05: 3 sessions = Thu+Fri+Mon (Mon 2026-11-09).
+        But Friday-close cutoff clamps to Fri 2026-11-06."""
+        from swing_option_strategy import _hold_end_date
+        self.assertEqual(_hold_end_date(dt.date(2026, 11, 5)),
+                         dt.date(2026, 11, 6))
+        # Confirmed Monday 2026-11-02: 3 sessions = Mon+Tue+Wed (2026-11-04).
+        # Friday is 2026-11-06, so 3-session rule is tighter.
+        self.assertEqual(_hold_end_date(dt.date(2026, 11, 2)),
+                         dt.date(2026, 11, 4))
+
+
 if __name__ == "__main__":
     unittest.main()

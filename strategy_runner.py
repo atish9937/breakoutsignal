@@ -218,6 +218,23 @@ def run_swing_next_session_checks(dh, master, day, now):
         traceback.print_exc()
 
 
+def run_swing_outcome_resolution(dh, master, day, now):
+    """Commit V: resolve P&L for any trigger_confirmed swing candidate whose
+    hold window has closed (or whose target/stop was hit). Idempotent."""
+    try:
+        resolved = swing_option_strategy.monitor_confirmed_outcomes(
+            dh, master, day, now, breakout.OUT
+        )
+        if resolved:
+            print(f"Resolved {len(resolved)} swing candidate outcome(s).")
+    except breakout.DhanAuthError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"Swing outcome resolution failed: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        traceback.print_exc()
+
+
 def run_swing_candidate_report(dh, master, universe, day):
     try:
         report = swing_option_strategy.scan_daily_candidates(
@@ -420,6 +437,11 @@ def main():
                         file=sys.stderr,
                     )
                     traceback.print_exc()
+        # Commit V: resolve P&L outcomes for prior-day swing candidates whose
+        # hold window has now closed. Runs before the next-day scan so the
+        # candidate files on disk already carry the resolved outcome when
+        # the next audit reads them.
+        run_swing_outcome_resolution(dh, master, day, dt.datetime.now(breakout.IST))
         run_swing_candidate_report(dh, master, universe, day)
         return report_path
 
