@@ -58,7 +58,11 @@ def run_cycle(dh, master, prep, universe, exclude, trend_expiry, day, now, fired
         else breakout.hm(breakout.CONFIG["run_end"])
     )
     scanners = []
-    if _at_or_before(now, breakout_end):
+    # Commit T: breakout + ORB disabled based on 30-day audit (breakout 2/22
+    # resolved wins; ORB 0/6). Skip scheduling entirely rather than running
+    # and discarding - avoids every downstream side effect (quote fetches,
+    # option-chain calls, Dhan API usage, scan jsonl writes).
+    if getattr(breakout, "ENABLED", True) and _at_or_before(now, breakout_end):
         scanners.append((
             "breakout",
             breakout.scan,
@@ -85,7 +89,9 @@ def run_cycle(dh, master, prep, universe, exclude, trend_expiry, day, now, fired
     # Commit R: ORB scan runs through REVERSE_WATCH_CUTOFF (14:00) so a late
     # stop-break on an earlier ORB fire can still trigger the symmetric flip.
     # Primary ORB fires are still gated to ENTRY_END (11:00) inside scan().
-    if _at_or_before(now, opening_range_breakout.REVERSE_WATCH_CUTOFF):
+    # Commit T: ORB disabled; see ENABLED comment in opening_range_breakout.py.
+    if (getattr(opening_range_breakout, "ENABLED", True)
+            and _at_or_before(now, opening_range_breakout.REVERSE_WATCH_CUTOFF)):
         trimmed = {s: sid for s, sid in universe.items() if s not in exclude}
         scanners.append((
             opening_range_breakout.STRATEGY,

@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import breakout_scanner as breakout
+import opening_range_breakout
 import strategy_runner
 import trend_pullback
 
@@ -48,16 +49,17 @@ class StrategyRunnerTests(unittest.TestCase):
         breakout_result = {"strategy": "breakout"}
         pullback_result = {"strategy": "trend_pullback"}
 
-        with patch.object(breakout, "scan", return_value=breakout_result) as scan_breakout:
-            with patch.object(trend_pullback, "scan", return_value=pullback_result) as scan_pullback:
-                with patch.object(
-                    strategy_runner.intraday_multiframe_strategy,
-                    "monitor_positions",
-                    return_value=[],
-                ) as monitor_positions:
-                    result = strategy_runner.run_cycle(
-                        client, master, prep, universe, exclude, prep["expiry"], day, now, fired
-                    )
+        with patch.object(breakout, "ENABLED", True), \
+             patch.object(breakout, "scan", return_value=breakout_result) as scan_breakout, \
+             patch.object(trend_pullback, "scan", return_value=pullback_result) as scan_pullback, \
+             patch.object(
+                strategy_runner.intraday_multiframe_strategy,
+                "monitor_positions",
+                return_value=[],
+             ) as monitor_positions:
+            result = strategy_runner.run_cycle(
+                client, master, prep, universe, exclude, prep["expiry"], day, now, fired
+            )
 
         self.assertEqual(result, {
             "breakout": breakout_result,
@@ -81,12 +83,13 @@ class StrategyRunnerTests(unittest.TestCase):
         now = dt.datetime(2026, 10, 19, 14, 1, tzinfo=breakout.IST)
         fired = {"breakout": set(), "trend_pullback": set()}
 
-        with patch.object(breakout, "scan", return_value={}) as scan_breakout:
-            with patch.object(trend_pullback, "scan") as scan_pullback:
-                result = strategy_runner.run_cycle(
-                    client, object(), prep, universe, set(), prep["expiry"], day, now,
-                    fired, ignore_entry_cutoff=True,
-                )
+        with patch.object(breakout, "ENABLED", True), \
+             patch.object(breakout, "scan", return_value={}) as scan_breakout, \
+             patch.object(trend_pullback, "scan") as scan_pullback:
+            result = strategy_runner.run_cycle(
+                client, object(), prep, universe, set(), prep["expiry"], day, now,
+                fired, ignore_entry_cutoff=True,
+            )
 
         self.assertEqual(result, {"breakout": {}})
         self.assertTrue(scan_breakout.call_args.kwargs["ignore_entry_cutoff"])
@@ -108,12 +111,13 @@ class StrategyRunnerTests(unittest.TestCase):
         client = Mock()
         now = dt.datetime(2026, 10, 19, 14, 30, 20, tzinfo=breakout.IST)
         fired = {"breakout": set(), "trend_pullback": set()}
-        with patch.object(breakout, "scan", return_value={}) as scan_breakout:
-            with patch.object(trend_pullback, "scan") as scan_pullback:
-                strategy_runner.run_cycle(
-                    client, object(), {}, {"AAA": 1}, set(), None,
-                    now.date(), now, fired, ignore_entry_cutoff=True,
-                )
+        with patch.object(breakout, "ENABLED", True), \
+             patch.object(breakout, "scan", return_value={}) as scan_breakout, \
+             patch.object(trend_pullback, "scan") as scan_pullback:
+            strategy_runner.run_cycle(
+                client, object(), {}, {"AAA": 1}, set(), None,
+                now.date(), now, fired, ignore_entry_cutoff=True,
+            )
         scan_breakout.assert_called_once()
         scan_pullback.assert_not_called()
 
@@ -168,6 +172,67 @@ class StrategyRunnerTests(unittest.TestCase):
         fired["breakout"].add("GRASIM_PE")
         self.assertIn("GRASIM_PE", fired["trend_pullback"])
         self.assertIn("GRASIM_PE", fired["daily_hourly_15m"])
+
+
+class DisabledStrategyTests(unittest.TestCase):
+    """Commit T: both the breakout_scanner and ORB modules carry an ENABLED
+    flag set to False after the 30-day audit on 2026-11-11 showed structurally
+    negative edge (breakout 2/22 resolved wins; ORB 0/6). The scheduler must
+    skip disabled strategies entirely so no scan is ever called (no quote
+    fetches, no option-chain calls, no side-effect writes)."""
+
+    def test_breakout_scan_not_called_when_disabled(self):
+        client = Mock()
+        master = object()
+        prep = {"expiry": "2026-10-29"}
+        universe = {"AAA": 1}
+        exclude = set()
+        day = dt.date(2026, 10, 19)
+        now = dt.datetime(2026, 10, 19, 10, 0, tzinfo=breakout.IST)
+        fired = {"breakout": set(), "trend_pullback": set()}
+
+        self.assertFalse(breakout.ENABLED,
+                         "Commit T: breakout_scanner.ENABLED must stay False "
+                         "until a rework + fresh backtest demonstrates edge.")
+        with patch.object(breakout, "scan") as scan_breakout, \
+             patch.object(trend_pullback, "scan", return_value={}), \
+             patch.object(
+                strategy_runner.intraday_multiframe_strategy,
+                "monitor_positions",
+                return_value=[],
+             ):
+            result = strategy_runner.run_cycle(
+                client, master, prep, universe, exclude, prep["expiry"],
+                day, now, fired,
+            )
+        scan_breakout.assert_not_called()
+        self.assertNotIn("breakout", result)
+
+    def test_orb_scan_not_called_when_disabled(self):
+        client = Mock()
+        master = object()
+        prep = {"expiry": "2026-10-29"}
+        universe = {"AAA": 1}
+        exclude = set()
+        day = dt.date(2026, 10, 19)
+        now = dt.datetime(2026, 10, 19, 10, 0, tzinfo=breakout.IST)
+        fired = {"breakout": set(), "trend_pullback": set()}
+
+        self.assertFalse(opening_range_breakout.ENABLED,
+                         "Commit T: opening_range_breakout.ENABLED must stay "
+                         "False until a rework + fresh backtest shows edge.")
+        with patch.object(opening_range_breakout, "scan") as scan_orb, \
+             patch.object(trend_pullback, "scan", return_value={}), \
+             patch.object(
+                strategy_runner.intraday_multiframe_strategy,
+                "monitor_positions",
+                return_value=[],
+             ):
+            strategy_runner.run_cycle(
+                client, master, prep, universe, exclude, prep["expiry"],
+                day, now, fired,
+            )
+        scan_orb.assert_not_called()
 
 
 class DedupeVerdictDowngradeTests(unittest.TestCase):

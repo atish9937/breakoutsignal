@@ -178,6 +178,15 @@ from dotenv import dotenv_values, load_dotenv, set_key
 # --------------------------------------------------------------------------------------
 # SETTINGS - change these to suit you
 # --------------------------------------------------------------------------------------
+# Commit T: scanner disabled after 30-day audit on 2026-11-11 showed 22 fires
+# produced only 2 wins (9.1% total, 16.7% resolved). An option strategy needs
+# >= 50% win rate at 1:1-1:2 R:R to break even; 17% is a structural edge
+# problem, not a tuning problem. Each day this fires, we pay for 10 stops to
+# collect 2 wins. Shut off the scheduler path entirely while we rebuild the
+# entry logic from scratch. Flip to True after the rework + fresh backtest
+# demonstrates > 50% resolved win rate over a representative sample.
+ENABLED = False
+
 CONFIG = {
     "capital": 72000,            # your trading capital in Rs
     "max_risk_pct": 2.0,         # max loss per trade as % of capital

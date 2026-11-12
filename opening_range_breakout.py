@@ -60,6 +60,15 @@ import pandas as pd
 import breakout_scanner as core
 
 
+# Commit T: strategy disabled after 30-day audit on 2026-11-11 showed 6 fires
+# produced 0 wins (0% win rate, 6 stops). Not a tuning problem - the ORB
+# pattern is structurally failing on current market regimes. Shut off the
+# scheduler path entirely while we re-examine whether the 0.20x ATR
+# penetration threshold, 09:15-09:45 OR period, or entry window gating are
+# miscalibrated. Flip to True after rework + fresh backtest demonstrates
+# > 50% resolved win rate.
+ENABLED = False
+
 STRATEGY = "opening_range_breakout"
 # OR period: first N minutes of the session
 OR_PERIOD_MINS = 30                 # 09:15-09:45
