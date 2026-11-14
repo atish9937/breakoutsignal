@@ -66,10 +66,15 @@ SWEEP_PENETRATION_ATR = 0.30       # Commit F: raised from 0.10 - 7 of 11 stops 
                                    # 5-day backtest were shallow pokes (pen < 0.5 ATR)
                                    # during ADX>25 regimes, which are usually trend
                                    # continuation, not stop-hunt reversals
-SWEEP_WICK_RATIO = 0.70            # Commit P: raised 0.65 -> 0.70 after Nov 4 review.
-                                   # ADANIPORTS PE (wick 0.947) was the only cleanly profitable
-                                   # sweep that day; 0.70 keeps the strongly rejected sweeps and
-                                   # filters borderline wicks that behave more like breakouts.
+SWEEP_WICK_RATIO = 0.65            # Commit W: reverted 0.70 -> 0.65. Commit P's bump was
+                                   # analytically "free safety" because the Nov 4 audit showed
+                                   # all 9 sweeps in the [0.65, 0.70) wick band already failed
+                                   # a downstream gate (8 at Displacement, 1 at Nifty align).
+                                   # But that also means the bump prevented zero losing fires -
+                                   # and it DOES hide those sweeps from the Commit S shadow log.
+                                   # Reverting widens the shadow-log capture window so the
+                                   # displacement-gate validation data covers wick 0.65-0.70
+                                   # too, not just 0.70+.
 SWEEP_VOLUME_RATIO = 1.3           # sweep bar volume >= this * 20-bar avg
 
 # Confirmation bar
