@@ -29,6 +29,14 @@ OPTION_REQUIRE_BID = True
 PREMIUM_STOP_FRAC = 0.60
 RISK_REWARD = 2.0
 PULLBACK_ATR = 0.35
+# Commit X: volatility gate. Nov 19 UNIONBANK CE lost Rs2,079 because the
+# underlying moved only +0.21 pts after fire (ATR15 ~= 0.4, ratio ~= 0.2%)
+# while the option premium bled theta. Same symbol Nov 20 moved +5.54 pts
+# and the same setup won Rs11,372. The deciding factor was 15-min volatility.
+# Block fires where ATR15 is below this fraction of underlying close - keeps
+# only setups with enough intrabar movement to overcome premium decay.
+MIN_ATR15_FRAC_OF_CLOSE = 0.0015    # 0.15% of close - roughly 2x typical
+                                     # option mid-to-ask spread at ATM
 _hourly_cache: dict[tuple[str, int], tuple[pd.Timestamp, pd.DataFrame]] = {}
 
 
@@ -90,7 +98,14 @@ def _setup(symbol: str, side: str, candles: pd.DataFrame, now: dt.datetime) -> d
     vwap = core.vwap(candles.loc[candles.index.date == now.date()])
     vwap_ok = float(last["close"]) > vwap if side == "CE" else float(last["close"]) < vwap
     risk = sign * (float(last["close"]) - stop)
-    if not (trend and pullback and confirmed and volume_ratio >= 1.0 and vwap_ok and risk > 0):
+    # Commit X: volatility gate. Filter out setups where the 15-min ATR is
+    # too small relative to price - these are the UNIONBANK Nov 19 pattern
+    # where the option bleeds theta faster than the underlying moves.
+    entry_price = float(last["close"])
+    volatility_ok = (entry_price > 0
+                     and (float(atr) / entry_price) >= MIN_ATR15_FRAC_OF_CLOSE)
+    if not (trend and pullback and confirmed and volume_ratio >= 1.0
+            and vwap_ok and risk > 0 and volatility_ok):
         return None
     raw_target = float(last["close"]) + sign * RISK_REWARD * risk
 

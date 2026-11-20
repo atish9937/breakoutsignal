@@ -322,6 +322,41 @@ class TradePerformanceTests(unittest.TestCase):
             )
         caption = send.call_args.args[3]
         self.assertIn("15m 1/1", caption)
+        # Commit X: caption must also surface net rupees inline. (11.5 - 10.2) * 50 = Rs65
+        self.assertIn("+Rs65", caption)
+
+    def test_telegram_caption_shows_negative_rupees_for_losing_15m_day(self):
+        """Commit X: losing 15m day must show a negative rupee amount so the
+        Telegram preview makes the loss visible without opening HTML."""
+        import json as _json
+        signals_path = self.root / f"daily_hourly_15m_signals_{SESSION.isoformat()}.jsonl"
+        signals_path.write_text(
+            _json.dumps({
+                "strategy": "daily_hourly_15m",
+                "symbol": "LOSER", "side": "CE",
+                "signal_time": "2026-10-21T10:05:20+05:30",
+                "expiry": "2026-10-29",
+                "option": {"strike": 100, "bid": 10.0, "ask": 10.2, "lot_size": 50},
+                "underlying_entry": 100, "underlying_stop": 95, "underlying_target": 110,
+                "underlying_exit_reference": 95,
+                # Exit bid 8.0 vs entry ask 10.2 -> P&L = (8 - 10.2) * 50 = -Rs110
+                "option_exit_quote": {"bid": 8.0, "ask": 8.3},
+                "exit_reason": "mandatory same-day exit",
+                "exit_time": "2026-10-21T15:10:00+05:30",
+                "status": "paper_exit_signal_sent",
+            }) + "\n",
+            encoding="utf-8",
+        )
+        generated_at = dt.datetime(2026, 10, 21, 15, 10, tzinfo=IST)
+        with patch.object(performance, "send_html_report", return_value="42") as send:
+            performance.finalize_day(
+                self.connection, SESSION, self.root, "token", "chat", generated_at
+            )
+        caption = send.call_args.args[3]
+        self.assertIn("15m 0/1", caption)
+        self.assertIn("-Rs110", caption)
+        # And the tag must sit alongside the W/R count, not elsewhere
+        self.assertIn("15m 0/1 (-Rs110)", caption)
 
     def test_failed_telegram_delivery_is_recorded_and_can_be_retried(self):
         generated_at = dt.datetime(2026, 10, 21, 15, 10, tzinfo=IST)

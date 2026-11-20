@@ -264,5 +264,104 @@ class IntradayMultiframeMonitorTests(unittest.TestCase):
             self.assertEqual(saved["status"], "paper_entry_signal_sent")
 
 
+class VolatilityFilterTests(unittest.TestCase):
+    """Commit X: 15m strategy now blocks fires with ATR15 below
+    MIN_ATR15_FRAC_OF_CLOSE (0.15% of close). Nov 19 UNIONBANK CE lost
+    Rs2,079 because the underlying moved only +0.21 pts with a tiny ATR15;
+    the same setup on Nov 20 won Rs11,372 because ATR15 was healthy. The
+    volatility gate filters the first pattern without blocking the second."""
+
+    def _ce_candles(self, close=100.0):
+        """30 15-min bars forming a valid CE pullback-reversal setup."""
+        import datetime as dt_local
+        idx = pd.date_range("2026-11-19 09:15", periods=30, freq="15min", tz=core.IST)
+        rows = []
+        # Trend: EMA9 > EMA21 + pullback to EMA21 + confirmation close above prev high
+        for i in range(25):
+            c = close + i * 0.3
+            rows.append([c, c + 0.5, c - 0.3, c, 1000.0])
+        # Pullback
+        rows.append([close + 7, close + 7.2, close + 6.3, close + 6.5, 1000.0])
+        rows.append([close + 6.5, close + 6.8, close + 6.3, close + 6.5, 1000.0])
+        # Signal bar + confirmation (close > previous high)
+        prev_high = rows[-1][1]
+        rows.append([close + 6.5, close + 8.0, close + 6.4, close + 8.0, 1500.0])
+        prev_high = rows[-1][1]
+        rows.append([close + 8.0, close + 8.5, close + 7.8, close + 8.3, 1500.0])
+        rows.append([close + 8.3, prev_high + 1.5, close + 8.0, prev_high + 1.2, 1500.0])
+        return pd.DataFrame(rows, index=idx[:len(rows)],
+                            columns=["open","high","low","close","volume"])
+
+    def test_low_atr_blocks_setup(self):
+        """ATR15/close below MIN_ATR15_FRAC_OF_CLOSE must reject the setup."""
+        import datetime as dt_local
+        candles = self._ce_candles(close=100.0)
+        now = dt_local.datetime(2026, 11, 19, 16, 50, tzinfo=core.IST)
+        # Last close in fixture is ~109.7. ATR 0.05 -> ratio ~0.00046 (below 0.0015)
+        with patch.object(core, "atr", return_value=0.05), \
+             patch.object(core, "ema", side_effect=lambda s, span:
+                 pd.Series({9: 108, 21: 107}[span], index=s.index)), \
+             patch.object(core, "vwap", return_value=104.0):
+            result = strategy._setup("TEST", "CE", candles, now)
+        self.assertIsNone(result,
+                          "Low-ATR setup must be rejected by the volatility gate")
+
+    def test_sufficient_atr_allows_setup(self):
+        """ATR15/close above MIN_ATR15_FRAC_OF_CLOSE must allow the setup."""
+        import datetime as dt_local
+        candles = self._ce_candles(close=100.0)
+        now = dt_local.datetime(2026, 11, 19, 16, 50, tzinfo=core.IST)
+        # ATR 1.0 vs close ~109.7 -> ratio ~0.0091 (well above 0.0015)
+        with patch.object(core, "atr", return_value=1.0), \
+             patch.object(core, "ema", side_effect=lambda s, span:
+                 pd.Series({9: 108, 21: 107}[span], index=s.index)), \
+             patch.object(core, "vwap", return_value=104.0):
+            result = strategy._setup("TEST", "CE", candles, now)
+        self.assertIsNotNone(result,
+                              "Setup with healthy ATR must pass the volatility gate")
+        self.assertEqual(result["side"], "CE")
+
+    def test_default_threshold(self):
+        self.assertEqual(strategy.MIN_ATR15_FRAC_OF_CLOSE, 0.0015)
+
+
+class SymmetricTrendTests(unittest.TestCase):
+    """Verify the daily/hourly trend gate is symmetric: bullish regime fires
+    only CE; bearish regime fires only PE; neutral/mixed fires neither."""
+
+    def _hourly(self, slope_up=True):
+        """50+ hourly bars with upward or downward slope."""
+        idx = pd.date_range("2026-11-17 09:15", periods=60, freq="60min", tz=core.IST)
+        delta = 0.3 if slope_up else -0.3
+        closes = [100 + i * delta for i in range(60)]
+        return pd.DataFrame({
+            "open": closes, "high": [c + 0.5 for c in closes],
+            "low": [c - 0.5 for c in closes], "close": closes,
+            "volume": [1000] * 60,
+        }, index=idx)
+
+    def test_bullish_daily_and_hourly_returns_ce(self):
+        import datetime as dt_local
+        now = dt_local.datetime(2026, 11, 20, 10, 0, tzinfo=core.IST)
+        daily = {"ema20": 110.0, "ema50": 100.0}
+        side = strategy._trend_side(daily, self._hourly(slope_up=True), now)
+        self.assertEqual(side, "CE")
+
+    def test_bearish_daily_and_hourly_returns_pe(self):
+        import datetime as dt_local
+        now = dt_local.datetime(2026, 11, 20, 10, 0, tzinfo=core.IST)
+        daily = {"ema20": 100.0, "ema50": 110.0}   # daily bearish
+        side = strategy._trend_side(daily, self._hourly(slope_up=False), now)
+        self.assertEqual(side, "PE")
+
+    def test_mixed_signals_returns_none(self):
+        """Daily bullish but hourly bearish (or vice versa) must NOT fire."""
+        import datetime as dt_local
+        now = dt_local.datetime(2026, 11, 20, 10, 0, tzinfo=core.IST)
+        daily = {"ema20": 110.0, "ema50": 100.0}
+        side = strategy._trend_side(daily, self._hourly(slope_up=False), now)
+        self.assertIsNone(side)
+
+
 if __name__ == "__main__":
     unittest.main()

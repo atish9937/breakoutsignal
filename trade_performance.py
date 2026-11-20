@@ -1242,6 +1242,13 @@ def finalize_day(
         if s.get("status") == "paper_exit_signal_sent"
         and (_multiframe_premium_estimate(s) or 0) > 0
     )
+    # Commit X: net rupee P&L for 15m so the Telegram preview shows an actual
+    # number without needing to open the HTML. Same ask->bid basis.
+    multiframe_net_rupees = sum(
+        _multiframe_premium_estimate(s) or 0
+        for s in multiframe_signals
+        if s.get("status") == "paper_exit_signal_sent"
+    )
 
     # Commit V: swing_option post-trigger P&L tracking. Count *resolved*
     # outcomes (target_hit / stop_hit / forced_exit) from any
@@ -1268,13 +1275,22 @@ def finalize_day(
     except Exception:  # noqa: BLE001
         pass
 
+    # Commit X: show 15m net rupees inline. "(+Rs16,207)" at a glance beats
+    # "4/4 wins - go open the HTML to find out the actual number". Format
+    # puts the sign BEFORE "Rs" so negatives read "(-Rs110)" not "(Rs-110)".
+    if multiframe_resolved:
+        _sign = "+" if multiframe_net_rupees >= 0 else "-"
+        _amt = abs(int(multiframe_net_rupees))
+        net_15m_tag = f" ({_sign}Rs{_amt:,})"
+    else:
+        net_15m_tag = ""
     caption = (
         f"Paper performance {session_date.isoformat()} IST | "
         f"Breakout {_wins_resolved('breakout')} T1 wins; "
         f"Trend {_wins_resolved('trend_pullback')}; "
         f"Sweep {_wins_resolved('liquidity_sweep')}; "
         f"ORB {_wins_resolved('opening_range_breakout')}; "
-        f"15m {multiframe_wins}/{multiframe_resolved}; "
+        f"15m {multiframe_wins}/{multiframe_resolved}{net_15m_tag}; "
         f"Swing {swing_wins}/{swing_resolved}. "
         "Underlying-based tracking; no orders placed."
     )
