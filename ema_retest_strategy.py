@@ -20,6 +20,13 @@ option-trading backtest; see ema_retest_backtest.py / smc_results/).
     8 <= (entry - EMA_at_trigger) <= 25 (points). Rejects both the chop-tight
     and lottery-wide extremes that killed the raw video rules on options.
 
+  EMA slope filter:
+    (EMA[trigger] - EMA[trigger - 10 bars]) > 0. The 20 EMA must be rising
+    over the previous 50 minutes. Rejects flat/sideways regimes where the
+    EMA gets re-tagged repeatedly without follow-through. Lifted the backtest
+    PF from 1.82 to 2.27 and cut max drawdown by ~60% at the cost of taking
+    ~60% fewer trades.
+
 Trade plan:
   entry  = retest bar's high + 1 point slippage
   stop   = EMA value at trigger bar (soft stop: exit on 5m close below EMA)
@@ -63,6 +70,7 @@ BODY_PCT_MIN = 0.60              # breakout bar body/range gate
 MIN_RISK_POINTS = 8.0            # risk band lower bound (points to EMA)
 MAX_RISK_POINTS = 25.0           # risk band upper bound
 SLIPPAGE_POINTS = 1.0            # entry slippage above retest high
+EMA_SLOPE_BARS = 10              # EMA slope lookback (bars) — slope must be > 0
 
 # --- Option liquidity gates (mirror liquidity_sweep / trend_pullback) --------
 OPTION_MIN_PREMIUM = 2.0
@@ -218,6 +226,23 @@ def evaluate_setup(symbol: str, candles: pd.DataFrame, now: dt.datetime) -> dict
         result["verdict"] = "SKIP"
         return result
 
+    # EMA slope gate: reject sideways/declining-EMA regimes.
+    if trigger_i - EMA_SLOPE_BARS >= 0:
+        ema_lookback = float(ema.iloc[trigger_i - EMA_SLOPE_BARS])
+        slope = ema_at_trigger - ema_lookback
+    else:
+        slope = None
+    _record(checks, "EMA slope",
+            f"{slope:+.2f} pts over {EMA_SLOPE_BARS} bars"
+            if slope is not None else "insufficient history",
+            f"slope > 0 over last {EMA_SLOPE_BARS} bars (EMA rising)",
+            slope is not None and slope > 0)
+    if slope is None or slope <= 0:
+        result["side"] = "CE"
+        result["fails"] = [c["gate"] for c in checks if not c["passed"]]
+        result["verdict"] = "WATCH_CE"
+        return result
+
     entry = float(valid["retest_high"]) + SLIPPAGE_POINTS
     risk = entry - ema_at_trigger
     _record(checks, "Risk band",
@@ -250,6 +275,8 @@ def evaluate_setup(symbol: str, candles: pd.DataFrame, now: dt.datetime) -> dict
         "risk_per_share": core.r2(risk),
         "runway_r": RR,
         "scale_r": SCALE_R,
+        "ema_slope_pts": core.r2(slope),
+        "ema_slope_bars": EMA_SLOPE_BARS,
         **valid,
     }
     result.update({

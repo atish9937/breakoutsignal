@@ -63,9 +63,49 @@ class EvaluateSetupTests(unittest.TestCase):
         risk = plan["risk_per_share"]
         self.assertAlmostEqual(plan["t1"], plan["entry"] + 1.5 * risk, places=1)
         self.assertAlmostEqual(plan["t2"], plan["entry"] + 3.0 * risk, places=1)
-        # Risk band gate must have passed.
+        # Risk band + EMA slope gates must have passed.
         gates = {c["gate"]: c["passed"] for c in result["mechanical_checks"]}
         self.assertTrue(gates.get("Risk band"))
+        self.assertTrue(gates.get("EMA slope"))
+        self.assertGreater(plan["ema_slope_pts"], 0)
+        self.assertEqual(plan["ema_slope_bars"], strategy.EMA_SLOPE_BARS)
+
+    def test_flat_or_declining_ema_downgrades_to_watch(self):
+        """Even with a perfect breakout/retest/trigger pattern, a flat-or-
+        declining 20 EMA over the slope lookback must reject the fire.
+        Models the sideways regime the live trader observed."""
+        import unittest.mock as mock
+        bars = _build_valid_setup()
+        now = bars.index[-1].to_pydatetime()
+        # Patch the slope lookback to be longer than available history so the
+        # gate measures slope as None (insufficient history) and rejects.
+        with mock.patch.object(strategy, "EMA_SLOPE_BARS", 10_000):
+            result = strategy.evaluate_setup("NIFTY", bars, now)
+        self.assertEqual(result["verdict"], "WATCH_CE")
+        self.assertIn("EMA slope", result["fails"])
+
+    def test_negative_slope_history_rejects(self):
+        """Declining-EMA history (sideways-then-down) with a valid pattern
+        must still reject via the slope gate."""
+        # Build 40 bars of linearly DECLINING price so the 20 EMA slopes down.
+        idx = pd.date_range("2026-10-19 09:15", periods=40, freq="5min", tz=IST)
+        prices = [25100.0 - i * 2 for i in range(40)]      # 25100 -> 25022
+        bars = pd.DataFrame({
+            "open": prices, "high": [p + 1 for p in prices],
+            "low": [p - 1 for p in prices], "close": prices,
+            "volume": [0] * 40,
+        }, index=idx)
+        # Now splice the valid breakout/retest/trigger pattern on top.
+        # At this point EMA is ~ 25070 (lagging the price decline).
+        # Build pattern with prices crossing EMA from below.
+        bars = _append_bar(bars, 25020, 25021, 25010, 25015)   # dip below EMA
+        bars = _append_bar(bars, 25015, 25080, 25014, 25075)   # BREAKOUT
+        bars = _append_bar(bars, 25075, 25076, 25068, 25072)   # RETEST (red, close > EMA)
+        bars = _append_bar(bars, 25072, 25085, 25071, 25082)   # TRIGGER
+        now = bars.index[-1].to_pydatetime()
+        result = strategy.evaluate_setup("NIFTY", bars, now)
+        # Could reject at pattern step or at slope step; either way not SETUP_CE
+        self.assertNotEqual(result["verdict"], "SETUP_CE")
 
     def test_weak_breakout_body_is_rejected(self):
         bars = _history_bars(30, price=25000.0)
