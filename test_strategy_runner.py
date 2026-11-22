@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import breakout_scanner as breakout
+import ema_retest_strategy
 import opening_range_breakout
 import strategy_runner
 import trend_pullback
@@ -48,10 +49,12 @@ class StrategyRunnerTests(unittest.TestCase):
         fired = {"breakout": set(), "trend_pullback": set()}
         breakout_result = {"strategy": "breakout"}
         pullback_result = {"strategy": "trend_pullback"}
+        ema_retest_result = {"strategy": "ema_retest"}
 
         with patch.object(breakout, "ENABLED", True), \
              patch.object(breakout, "scan", return_value=breakout_result) as scan_breakout, \
              patch.object(trend_pullback, "scan", return_value=pullback_result) as scan_pullback, \
+             patch.object(ema_retest_strategy, "scan", return_value=ema_retest_result), \
              patch.object(
                 strategy_runner.intraday_multiframe_strategy,
                 "monitor_positions",
@@ -64,6 +67,7 @@ class StrategyRunnerTests(unittest.TestCase):
         self.assertEqual(result, {
             "breakout": breakout_result,
             "trend_pullback": pullback_result,
+            "ema_retest": ema_retest_result,
         })
         self.assertIs(scan_breakout.call_args.args[0], client)
         self.assertIs(scan_pullback.call_args.args[0], client)
@@ -85,13 +89,18 @@ class StrategyRunnerTests(unittest.TestCase):
 
         with patch.object(breakout, "ENABLED", True), \
              patch.object(breakout, "scan", return_value={}) as scan_breakout, \
-             patch.object(trend_pullback, "scan") as scan_pullback:
+             patch.object(trend_pullback, "scan") as scan_pullback, \
+             patch.object(ema_retest_strategy, "scan") as scan_ema_retest:
             result = strategy_runner.run_cycle(
                 client, object(), prep, universe, set(), prep["expiry"], day, now,
                 fired, ignore_entry_cutoff=True,
             )
 
-        self.assertEqual(result, {"breakout": {}})
+        # 14:01 is past ema_retest.ENTRY_END (14:30 is the cutoff; this test
+        # runs 14:01 which is before — but it's past the 12:35 cutoff for
+        # trend_pullback and ORB's 14:00 REVERSE_WATCH_CUTOFF). ema_retest's
+        # own 14:30 cutoff means it still runs.
+        self.assertEqual(result, {"breakout": {}, "ema_retest": scan_ema_retest.return_value})
         self.assertTrue(scan_breakout.call_args.kwargs["ignore_entry_cutoff"])
         scan_pullback.assert_not_called()
 
@@ -151,14 +160,20 @@ class StrategyRunnerTests(unittest.TestCase):
         fired = {"breakout": set(), "trend_pullback": set()}
         result = {"strategy": "trend_pullback"}
 
+        ema_retest_result = {"strategy": "ema_retest"}
         with patch.object(breakout, "scan", side_effect=RuntimeError("breakout failed")):
             with patch.object(trend_pullback, "scan", return_value=result) as scan_pullback:
-                with patch("sys.stderr"):
-                    outputs = strategy_runner.run_cycle(
-                        client, master, prep, universe, set(), prep["expiry"], day, now, fired
-                    )
+                with patch.object(ema_retest_strategy, "scan",
+                                   return_value=ema_retest_result):
+                    with patch("sys.stderr"):
+                        outputs = strategy_runner.run_cycle(
+                            client, master, prep, universe, set(), prep["expiry"], day, now, fired
+                        )
 
-        self.assertEqual(outputs, {"trend_pullback": result})
+        self.assertEqual(outputs, {
+            "trend_pullback": result,
+            "ema_retest": ema_retest_result,
+        })
         scan_pullback.assert_called_once()
 
     def test_cross_strategy_fired_set_is_shared_so_duplicates_are_skipped(self):

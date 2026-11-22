@@ -116,7 +116,7 @@ def _gate(summary: dict, pnl_key: str, count_key: str) -> dict:
 
 def build(connection: sqlite3.Connection) -> dict:
     result = {"generated_at": dt.datetime.now().isoformat(timespec="seconds"), "strategies": {}}
-    for name in ("breakout", "trend_pullback"):
+    for name in ("breakout", "trend_pullback", "ema_retest"):
         summary = _tracked(connection, name)
         summary["gate"] = _gate(summary, "premium_pnl_per_lot_rupees", "premium_priced")
         result["strategies"][name] = summary

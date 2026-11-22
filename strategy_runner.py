@@ -12,6 +12,7 @@ import traceback
 import requests
 
 import breakout_scanner as breakout
+import ema_retest_strategy
 import intraday_multiframe_strategy
 import trend_pullback
 import liquidity_sweep
@@ -98,6 +99,14 @@ def run_cycle(dh, master, prep, universe, exclude, trend_expiry, day, now, fired
             opening_range_breakout.scan,
             (dh, master, prep, trimmed, day, now,
              fired.setdefault(opening_range_breakout.STRATEGY, set())),
+            {},
+        ))
+    if _at_or_before(now, ema_retest_strategy.ENTRY_END):
+        scanners.append((
+            ema_retest_strategy.STRATEGY,
+            ema_retest_strategy.scan,
+            (dh, master, prep, universe, day, now,
+             fired.setdefault(ema_retest_strategy.STRATEGY, set())),
             {},
         ))
     results = {}
@@ -317,6 +326,8 @@ def main():
     signal_files = (
         ("breakout", breakout.OUT / f"signals_{day}.jsonl"),
         ("trend_pullback", breakout.OUT / f"trend_pullback_signals_{day}.jsonl"),
+        (ema_retest_strategy.STRATEGY,
+         breakout.OUT / f"{ema_retest_strategy.STRATEGY}_signals_{day}.jsonl"),
     )
     saved_signal_ids = dict(universe)
     if eq is not None:
@@ -344,6 +355,7 @@ def main():
         breakout.OUT / f"daily_hourly_15m_signals_{day}.jsonl",
         breakout.OUT / f"liquidity_sweep_signals_{day}.jsonl",
         breakout.OUT / f"opening_range_breakout_signals_{day}.jsonl",
+        breakout.OUT / f"{ema_retest_strategy.STRATEGY}_signals_{day}.jsonl",
     ):
         cross_fired |= load_fired_signals(signal_file)
     # Share one set across strategies: once any scanner has recommended
@@ -355,6 +367,7 @@ def main():
         "daily_hourly_15m": cross_fired,
         liquidity_sweep.STRATEGY: cross_fired,
         opening_range_breakout.STRATEGY: cross_fired,
+        ema_retest_strategy.STRATEGY: cross_fired,
     }
 
     if args.once:

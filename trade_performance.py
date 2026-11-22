@@ -39,7 +39,7 @@ def connect(database: Path) -> sqlite3.Connection:
         );
         CREATE TABLE IF NOT EXISTS paper_trades (
             id INTEGER PRIMARY KEY,
-            strategy TEXT NOT NULL CHECK (strategy IN ('breakout', 'trend_pullback', 'liquidity_sweep', 'opening_range_breakout')),
+            strategy TEXT NOT NULL CHECK (strategy IN ('breakout', 'trend_pullback', 'liquidity_sweep', 'opening_range_breakout', 'ema_retest')),
             session_date TEXT NOT NULL,
             symbol TEXT NOT NULL,
             side TEXT NOT NULL CHECK (side IN ('CE', 'PE')),
@@ -197,7 +197,7 @@ def connect(database: Path) -> sqlite3.Connection:
     # NEWEST strategy name - if it's not in the current SQL, the migration
     # runs. This is safe to re-execute as new strategies are added over time
     # (just extend the check for each new strategy name).
-    required_strategies = ("liquidity_sweep", "opening_range_breakout")
+    required_strategies = ("liquidity_sweep", "opening_range_breakout", "ema_retest")
     current_sql = connection.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='paper_trades'"
     ).fetchone()
@@ -219,7 +219,7 @@ def connect(database: Path) -> sqlite3.Connection:
             """
             CREATE TABLE paper_trades_v7 (
                 id INTEGER PRIMARY KEY,
-                strategy TEXT NOT NULL CHECK (strategy IN ('breakout', 'trend_pullback', 'liquidity_sweep', 'opening_range_breakout')),
+                strategy TEXT NOT NULL CHECK (strategy IN ('breakout', 'trend_pullback', 'liquidity_sweep', 'opening_range_breakout', 'ema_retest')),
                 session_date TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL CHECK (side IN ('CE', 'PE')),
@@ -905,7 +905,8 @@ def render_html(
     # the dashboard until surfaced here.
     summaries = {
         name: _metrics([row for row in rows if row["strategy"] == name])
-        for name in ("breakout", "trend_pullback", "liquidity_sweep", "opening_range_breakout")
+        for name in ("breakout", "trend_pullback", "liquidity_sweep",
+                     "opening_range_breakout", "ema_retest")
     }
     labels = {
         "tracking": "No target/stop yet",
@@ -1225,7 +1226,8 @@ def finalize_day(
 
     by_strategy = {
         name: _metrics([row for row in rows if row["strategy"] == name])
-        for name in ("breakout", "trend_pullback", "liquidity_sweep", "opening_range_breakout")
+        for name in ("breakout", "trend_pullback", "liquidity_sweep",
+                     "opening_range_breakout", "ema_retest")
     }
     def _wins_resolved(name):
         return f"{by_strategy[name]['wins']}/{by_strategy[name]['resolved']}"
@@ -1290,6 +1292,7 @@ def finalize_day(
         f"Trend {_wins_resolved('trend_pullback')}; "
         f"Sweep {_wins_resolved('liquidity_sweep')}; "
         f"ORB {_wins_resolved('opening_range_breakout')}; "
+        f"EMA_Retest {_wins_resolved('ema_retest')}; "
         f"15m {multiframe_wins}/{multiframe_resolved}{net_15m_tag}; "
         f"Swing {swing_wins}/{swing_resolved}. "
         "Underlying-based tracking; no orders placed."
