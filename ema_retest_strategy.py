@@ -316,19 +316,143 @@ def _notify(text: str) -> None:
 def notify_signal(result: dict) -> None:
     plan = result["plan"]
     opt = result.get("option") or {}
+    rr_t1 = SCALE_R          # 1:1.5 planned
+    rr_t2 = RR               # 1:3 planned
     _notify(
         f"[EMA Retest] {result['verdict']} {result['symbol']} spot {result['ltp']}\n"
         f"20 EMA breakout + retest confirmed (body "
-        f"{plan.get('breakout_body_pct', 0):.0%}, risk {plan['risk_per_share']} pts)\n"
+        f"{plan.get('breakout_body_pct', 0):.0%}, risk {plan['risk_per_share']} pts, "
+        f"EMA slope {plan.get('ema_slope_pts', 0):+.1f}/{plan.get('ema_slope_bars', 0)}b)\n"
         f"{opt.get('contract', 'option tbd')} [{opt.get('selection', '?')}] "
         f"~Rs{opt.get('premium', '?')} | lot {opt.get('lot_size', '?')}\n"
-        f"Entry {plan['entry']} | stop {plan['stop']} | T1 {plan['t1']} (scale) | T2 {plan['t2']}\n"
-        f"Approx. loss/lot Rs{plan.get('estimated_loss_per_lot', '?')}\n"
+        f"Entry {plan['entry']} | stop {plan['stop']} | "
+        f"T1 {plan['t1']} (1:{rr_t1:g} scale) | T2 {plan['t2']} (1:{rr_t2:g})\n"
+        f"Planned R:R 1:{rr_t2:g} | approx. loss/lot Rs{plan.get('estimated_loss_per_lot', '?')}\n"
         f"Checks passed: {sum(c['passed'] for c in result['mechanical_checks'])}/"
         f"{len(result['mechanical_checks'])}\n"
         "Recommendations only; no order was placed. Scale 50% at T1; "
         "exit remainder on EMA close or T2."
     )
+
+
+# ---------------------------------------------------------------------------
+# Exit monitor — sends per-exit Telegram alerts when a tracked trade
+# transitions out of 'tracking' status. Mirrors intraday_multiframe's
+# monitor_positions() but reads from paper_trades (SQLite) rather than JSONL.
+# ---------------------------------------------------------------------------
+STATUS_LABELS = {
+    "t1_hit": "T1 reached (scale level)",
+    "t2_hit": "T2 reached",
+    "stop_before_t1": "Stopped before T1",
+    "t1_then_breakeven": "T1 reached; breakeven exit",
+    "unresolved": "Unresolved at cutoff",
+}
+
+
+def _exit_notified_file(day: dt.date):
+    return OUT / f"{STRATEGY}_exit_notified_{day}.jsonl"
+
+
+def _load_notified_ids(day: dt.date) -> set[int]:
+    path = _exit_notified_file(day)
+    ids: set[int] = set()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    ids.add(int(line))
+                except ValueError:
+                    continue
+    return ids
+
+
+def _mark_notified(day: dt.date, trade_id: int) -> None:
+    path = _exit_notified_file(day)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(f"{trade_id}\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def notify_exit(row: dict) -> None:
+    """Build and send the per-exit Telegram message for one paper_trades row."""
+    entry = float(row["reference_entry"])
+    stop = float(row["stop_price"])
+    t1 = float(row["target_1"])
+    t2 = float(row["target_2"])
+    last_price = row.get("last_price")
+    sign = 1 if row["side"] == "CE" else -1
+    risk = (entry - stop) * sign
+    status = row.get("status", "unresolved")
+    status_label = STATUS_LABELS.get(status, status)
+
+    # Realized R-multiple (signed): >0 if moved toward target, <0 if toward stop.
+    realized_r = None
+    if last_price is not None and risk > 0:
+        move = (float(last_price) - entry) * sign
+        realized_r = move / risk
+
+    option_tag = ""
+    if row.get("option_security_id"):
+        option_tag = (
+            f"{row.get('option_expiry') or ''} {row['side']} "
+            f"@entry bid/ask {row.get('option_entry_bid') or 0:.2f}/"
+            f"{row.get('option_entry_ask') or 0:.2f} | lot {row.get('option_lot_size') or '?'}\n"
+        )
+
+    lines = [
+        f"[EMA Retest EXIT] {row['symbol']} {row['side']} | {status_label}",
+        option_tag.rstrip() if option_tag else None,
+        f"Entry {entry:.2f} | stop {stop:.2f} | T1 {t1:.2f} | T2 {t2:.2f}",
+        (f"Last {float(last_price):.2f} | realized {realized_r:+.2f}R (risk {risk:.1f} pts)"
+         if last_price is not None and realized_r is not None
+         else f"Last price unavailable | risk {risk:.1f} pts"),
+        "Paper exit; no order was placed and this is not a verified fill.",
+    ]
+    _notify("\n".join(line for line in lines if line))
+
+
+def monitor_exits(ledger, day: dt.date, now: dt.datetime) -> list[dict]:
+    """Send Telegram alerts for ema_retest paper_trades that just left
+    'tracking' status. Idempotent — each trade is notified at most once
+    per session via the on-disk notified-id log."""
+    if ledger is None:
+        return []
+    # Dedupe file stops duplicate alerts if the runner is restarted mid-day.
+    already_notified = _load_notified_ids(day)
+    try:
+        rows = ledger.execute(
+            """
+            SELECT * FROM paper_trades
+            WHERE strategy = ? AND session_date = ? AND status != 'tracking'
+            """,
+            (STRATEGY, day.isoformat()),
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        print(f"{STRATEGY} exit monitor DB read failed: {exc}", file=sys.stderr)
+        return []
+
+    newly_notified: list[dict] = []
+    for row in rows:
+        trade_id = int(row["id"])
+        if trade_id in already_notified:
+            continue
+        row_dict = dict(row)
+        try:
+            notify_exit(row_dict)
+        except Exception as exc:  # noqa: BLE001
+            print(f"{STRATEGY} exit Telegram failed for id={trade_id}: {exc}",
+                  file=sys.stderr)
+            # Still mark notified so a broken Telegram doesn't flood on retry.
+        try:
+            _mark_notified(day, trade_id)
+        except OSError as exc:
+            print(f"{STRATEGY} exit-notified file write failed: {exc}",
+                  file=sys.stderr)
+            continue
+        newly_notified.append(row_dict)
+    return newly_notified
 
 
 # ---------------------------------------------------------------------------

@@ -937,6 +937,21 @@ def render_html(
         )
         pnl = _trade_premium_pnl(row)
         pnl_text = f"{pnl:.2f} / lot" if pnl is not None else "N/A"
+        # Risk:Reward columns — planned (from entry/stop/T2) and realized
+        # (from last_price). CE: risk = entry-stop; move = last-entry.
+        # PE: risk = stop-entry; move = entry-last. Realized is signed.
+        sign = 1 if row["side"] == "CE" else -1
+        risk_pts = (row["reference_entry"] - row["stop_price"]) * sign
+        if risk_pts > 0:
+            t2_r = (row["target_2"] - row["reference_entry"]) * sign / risk_pts
+            planned_rr = f"1:{t2_r:.1f}"
+        else:
+            planned_rr = "N/A"
+        if row["last_price"] is not None and risk_pts > 0:
+            realized_r = (row["last_price"] - row["reference_entry"]) * sign / risk_pts
+            realized_rr = f"{realized_r:+.2f}R"
+        else:
+            realized_rr = "N/A"
         body_rows.append(
             "<tr>"
             f"<td>{html.escape(row['strategy'].replace('_', ' ').title())}</td>"
@@ -949,6 +964,8 @@ def render_html(
             f"<td>{row['stop_price']:.2f}</td>"
             f"<td>{row['target_1']:.2f}</td>"
             f"<td>{row['target_2']:.2f}</td>"
+            f"<td>{planned_rr}</td>"
+            f"<td>{realized_rr}</td>"
             f"<td>{last_price}</td>"
             f"<td>{html.escape(row['last_candle_at'] or '')}</td>"
             f"<td class='status {html.escape(row['status'])}'>{html.escape(labels[row['status']])}</td>"
@@ -1077,7 +1094,8 @@ def render_html(
         "<div class='table-wrap'><table><thead><tr>"
         "<th>Strategy</th><th>Symbol</th><th>Side</th><th>Option contract</th>"
         "<th>Signal option bid/ask</th><th>Entry reached (IST)</th><th>Reference</th>"
-        "<th>Stop</th><th>T1</th><th>T2</th><th>Last price</th><th>Price candle (IST)</th><th>Outcome</th>"
+        "<th>Stop</th><th>T1</th><th>T2</th><th>Planned R:R</th><th>Realized R</th>"
+        "<th>Last price</th><th>Price candle (IST)</th><th>Outcome</th>"
         "<th>T1 hit</th><th>T2 hit</th><th>Indicative option P&amp;L (candle close)</th><th>Tracking notes</th>"
         "<th>Option live quote samples</th><th>Underlying live quote samples</th>"
         "<th>Data capture notes</th>"

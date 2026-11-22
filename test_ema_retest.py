@@ -237,6 +237,86 @@ class LedgerIntegrationTests(unittest.TestCase):
                              {"strategy": "ema_retest", "symbol": "NIFTY", "side": "CE"})
             conn.close()
 
+    def test_monitor_exits_sends_once_and_dedupes(self):
+        """Regression: monitor_exits must fire a Telegram alert once per trade
+        exit and never again, even if run multiple times (idempotent via
+        notified-id file). Mirrors intraday_multiframe's one-shot pattern."""
+        import tempfile
+        import unittest.mock as mock
+        import trade_performance as performance
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with mock.patch.object(strategy, "OUT", root):
+                conn = performance.connect(root / "ledger.sqlite3")
+                performance.record_buy_recommendations(
+                    conn, strategy.STRATEGY, self._ema_retest_snapshot(),
+                    {"NIFTY": 13}, dt.date(2026, 11, 22),
+                )
+                # Simulate the open-trade updater flipping status to t1_hit
+                conn.execute(
+                    "UPDATE paper_trades SET status = 't1_hit', last_price = 25040 "
+                    "WHERE strategy = 'ema_retest'"
+                )
+                conn.commit()
+
+                with mock.patch.object(strategy, "_notify") as notify:
+                    exits_first = strategy.monitor_exits(
+                        conn, dt.date(2026, 11, 22),
+                        dt.datetime(2026, 11, 22, 10, 35, tzinfo=IST),
+                    )
+                    self.assertEqual(len(exits_first), 1)
+                    self.assertEqual(notify.call_count, 1)
+                    # Message content should include the realized R-multiple
+                    msg = notify.call_args.args[0]
+                    self.assertIn("EMA Retest EXIT", msg)
+                    self.assertIn("realized", msg.lower())
+
+                    # Run again — must NOT re-notify.
+                    exits_second = strategy.monitor_exits(
+                        conn, dt.date(2026, 11, 22),
+                        dt.datetime(2026, 11, 22, 10, 40, tzinfo=IST),
+                    )
+                    self.assertEqual(len(exits_second), 0)
+                    self.assertEqual(notify.call_count, 1)
+                conn.close()
+
+    def test_html_report_has_planned_and_realized_rr_columns(self):
+        """P&L report must surface planned R:R (from entry/stop/T2) and
+        realized R-multiple (from last_price) so the dashboard quantifies
+        the strategy's edge."""
+        import tempfile
+        import unittest.mock as mock
+        import trade_performance as performance
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            conn = performance.connect(root / "ledger.sqlite3")
+            performance.record_buy_recommendations(
+                conn, strategy.STRATEGY, self._ema_retest_snapshot(),
+                {"NIFTY": 13}, dt.date(2026, 11, 22),
+            )
+            # Simulate a partial move so realized R is meaningful.
+            conn.execute(
+                "UPDATE paper_trades SET last_price = 25029 WHERE strategy = 'ema_retest'"
+            )
+            conn.commit()
+            generated = dt.datetime(2026, 11, 22, 15, 36, tzinfo=IST)
+            with mock.patch.object(performance, "send_html_report", return_value="42"):
+                report_path = performance.finalize_day(
+                    conn, dt.date(2026, 11, 22), root, "token", "chat", generated,
+                )
+            html_text = Path(report_path).read_text(encoding="utf-8")
+            self.assertIn("Planned R:R", html_text)
+            self.assertIn("Realized R", html_text)
+            # Plan: risk=12 (entry 25017 - stop 25005), T2=25053 -> 36/12 = 3.0R
+            self.assertIn("1:3.0", html_text)
+            # Realized: (25029-25017)/12 = +1.00R
+            self.assertIn("+1.00R", html_text)
+            conn.close()
+
     def test_daily_report_caption_includes_ema_retest_line(self):
         """Caption line regression: Telegram preview must surface EMA_Retest
         W/R so the report doesn't silently drop the strategy like it once did

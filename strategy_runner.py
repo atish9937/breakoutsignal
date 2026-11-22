@@ -142,6 +142,18 @@ def run_cycle(dh, master, prep, universe, exclude, trend_expiry, day, now, fired
                 file=sys.stderr,
             )
             traceback.print_exc()
+        try:
+            exits = ema_retest_strategy.monitor_exits(
+                ledger, day, dt.datetime.now(breakout.IST)
+            )
+            if exits:
+                print(f"Sent {len(exits)} ema_retest paper exit notification(s).")
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"ema_retest exit monitor failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            traceback.print_exc()
     try:
         signals = intraday_multiframe_strategy.scan(
             dh,
