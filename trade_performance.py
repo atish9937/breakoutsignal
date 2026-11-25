@@ -1242,13 +1242,33 @@ def finalize_day(
         print(error, file=sys.stderr)
         return report_path
 
+    paper_trade_strategies = ("breakout", "trend_pullback", "liquidity_sweep",
+                              "opening_range_breakout", "ema_retest")
     by_strategy = {
         name: _metrics([row for row in rows if row["strategy"] == name])
-        for name in ("breakout", "trend_pullback", "liquidity_sweep",
-                     "opening_range_breakout", "ema_retest")
+        for name in paper_trade_strategies
     }
+    # Commit Y: per-strategy net option rupee P&L using the same ask ->
+    # exit_close basis the HTML's "Indicative option P&L" column already
+    # uses. Matches what auto-buy-sell would net per fire. Missing values
+    # (unresolved trades or no option candle archived yet) contribute 0 so
+    # partial-resolution days still surface the resolved portion.
+    strategy_net_rupees = {
+        name: sum(
+            (_trade_premium_pnl(row) or 0)
+            for row in rows
+            if row["strategy"] == name
+        )
+        for name in paper_trade_strategies
+    }
+    def _fmt_rupees(amount):
+        if not amount:
+            return ""
+        sign = "+" if amount >= 0 else "-"
+        return f" ({sign}Rs{abs(int(amount)):,})"
     def _wins_resolved(name):
-        return f"{by_strategy[name]['wins']}/{by_strategy[name]['resolved']}"
+        base = f"{by_strategy[name]['wins']}/{by_strategy[name]['resolved']}"
+        return base + _fmt_rupees(strategy_net_rupees[name])
 
     # 15-min same-day strategy lives in a JSONL (daily_hourly_15m_signals_*.jsonl),
     # not in paper_trades, so compute its wins/resolved from the multiframe list.
@@ -1295,15 +1315,9 @@ def finalize_day(
     except Exception:  # noqa: BLE001
         pass
 
-    # Commit X: show 15m net rupees inline. "(+Rs16,207)" at a glance beats
-    # "4/4 wins - go open the HTML to find out the actual number". Format
-    # puts the sign BEFORE "Rs" so negatives read "(-Rs110)" not "(Rs-110)".
-    if multiframe_resolved:
-        _sign = "+" if multiframe_net_rupees >= 0 else "-"
-        _amt = abs(int(multiframe_net_rupees))
-        net_15m_tag = f" ({_sign}Rs{_amt:,})"
-    else:
-        net_15m_tag = ""
+    # Commit X: show 15m net rupees inline. Reuses Commit Y's _fmt_rupees so
+    # negatives read "(-Rs110)" not "(Rs-110)" and zero-P&L days omit the tag.
+    net_15m_tag = _fmt_rupees(multiframe_net_rupees) if multiframe_resolved else ""
     caption = (
         f"Paper performance {session_date.isoformat()} IST | "
         f"Breakout {_wins_resolved('breakout')} T1 wins; "

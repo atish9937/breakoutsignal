@@ -325,6 +325,70 @@ class TradePerformanceTests(unittest.TestCase):
         # Commit X: caption must also surface net rupees inline. (11.5 - 10.2) * 50 = Rs65
         self.assertIn("+Rs65", caption)
 
+    def test_commit_y_caption_shows_rupee_pnl_for_paper_trade_strategies(self):
+        """Commit Y: non-15m strategies (breakout/trend/sweep/ORB/ema_retest)
+        resolved via paper_trades + option 1-min candle archive must also
+        show inline rupee P&L in the Telegram caption, matching the HTML's
+        "Indicative option P&L" column (ask -> exit_close basis)."""
+        # Record a BUY for liquidity_sweep then simulate a target hit.
+        snapshot = buy_snapshot()
+        snapshot["results"][0]["symbol"] = "AAA"
+        snapshot["results"][0]["side"] = "CE"
+        performance.record_buy_recommendations(
+            self.connection, "liquidity_sweep", snapshot, {"AAA": 123}, SESSION
+        )
+        # Walk the trade to t2_hit via an underlying candle that reaches 110
+        underlying_times = pd.DatetimeIndex(["2026-10-21 09:21"], tz="Asia/Kolkata")
+        underlying_candles = pd.DataFrame(
+            [{"open": 100, "high": 112, "low": 99, "close": 111}],
+            index=underlying_times,
+        )
+        dhan = Mock()
+        dhan.intraday.return_value = underlying_candles
+        performance.update_open_trades(
+            self.connection, dhan, SESSION,
+            dt.datetime(2026, 10, 21, 9, 26, tzinfo=IST),
+        )
+        row = self.connection.execute("SELECT id, status, target_2_at FROM paper_trades").fetchone()
+        self.assertEqual(row["status"], "t2_hit")
+        # Insert an option 1-min candle AT (or before) target_2_at so
+        # _trade_premium_pnl can pick it up as option_exit_close.
+        self.connection.execute(
+            """
+            INSERT INTO paper_instrument_candles (
+                trade_id, instrument_type, exchange_segment, security_id,
+                interval_minutes, candle_time, open, high, low, close, fetched_at
+            ) VALUES (?, 'option', 'NSE_FNO', 456, 1, ?, 14.0, 14.1, 13.9, 14.0, ?)
+            """,
+            (row["id"], row["target_2_at"],
+             dt.datetime.now(dt.timezone.utc).isoformat()),
+        )
+        self.connection.commit()
+        # Entry ask 12.1, lot 10 -> P&L = (14.0 - 12.1) * 10 = Rs19 win
+        generated_at = dt.datetime(2026, 10, 21, 15, 10, tzinfo=IST)
+        with patch.object(performance, "send_html_report", return_value="42") as send:
+            performance.finalize_day(
+                self.connection, SESSION, self.root, "token", "chat", generated_at
+            )
+        caption = send.call_args.args[3]
+        self.assertIn("Sweep 1/1 (+Rs19)", caption,
+                      f"Sweep rupee tag missing. Got: {caption}")
+
+    def test_commit_y_zero_pnl_strategy_shows_no_rupee_tag(self):
+        """Strategies with no fires (or zero P&L) must NOT get a rupee tag -
+        the caption should stay compact."""
+        self.add_buy(strategy="liquidity_sweep")
+        # No candle archive -> _trade_premium_pnl returns None -> no tag
+        generated_at = dt.datetime(2026, 10, 21, 15, 10, tzinfo=IST)
+        with patch.object(performance, "send_html_report", return_value="42") as send:
+            performance.finalize_day(
+                self.connection, SESSION, self.root, "token", "chat", generated_at
+            )
+        caption = send.call_args.args[3]
+        # Breakout has 0/0 and 0 P&L -> no rupee tag
+        self.assertIn("Breakout 0/0 T1 wins", caption)
+        self.assertNotIn("Breakout 0/0 (", caption)
+
     def test_telegram_caption_shows_negative_rupees_for_losing_15m_day(self):
         """Commit X: losing 15m day must show a negative rupee amount so the
         Telegram preview makes the loss visible without opening HTML."""
